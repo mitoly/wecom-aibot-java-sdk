@@ -1,0 +1,33 @@
+# 构建产物
+target/
+*.class
+*.jar
+*.war
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.project
+.classpath
+.settings/
+
+# Maven
+.mvn/wrapper/
+mvnw
+mvnw.cmd
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 凭证文件（绝对不能提交！）
+bot_id.txt
+secret.txt
+*.key
+*.pem
+*.p12
+
+# 日志
+*.log
+logs/
