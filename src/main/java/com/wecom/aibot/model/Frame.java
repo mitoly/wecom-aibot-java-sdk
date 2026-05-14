@@ -3,6 +3,8 @@ package com.wecom.aibot.model;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.annotation.JsonSetter;
+import com.fasterxml.jackson.annotation.Nulls;
 import com.fasterxml.jackson.databind.JsonNode;
 
 /**
@@ -22,6 +24,7 @@ public class Frame {
     private JsonNode body;
 
     @JsonProperty("errcode")
+    @JsonInclude(JsonInclude.Include.NON_DEFAULT)
     private int errCode;
 
     @JsonProperty("errmsg")

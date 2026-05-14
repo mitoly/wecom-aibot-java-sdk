@@ -46,13 +46,15 @@ public class WeComAiBotClient {
     private final Object writeLock = new Object(); // 保护写操作，避免 TOCTOU 竞态
     private final AtomicBoolean connected = new AtomicBoolean(false);
     private volatile boolean closedByServer = false;
-    private final CountDownLatch disconnectLatch = new CountDownLatch(1);
 
     // 待处理的请求响应（req_id -> CompletableFuture）
     private final ConcurrentHashMap<String, CompletableFuture<Frame>> pending = new ConcurrentHashMap<>();
 
     // 心跳定时器
     private ScheduledExecutorService heartbeatExecutor;
+
+    // 消息分发线程池（避免使用公共 ForkJoinPool，防止阻塞操作耗尽线程）
+    private final ExecutorService dispatchExecutor;
 
     // 运行控制
     private volatile boolean running = false;
@@ -72,10 +74,17 @@ public class WeComAiBotClient {
         this.options = options;
         this.log = new AiBotLogger.Slf4jLogger();
         this.emitter = new EventEmitter();
+        this.emitter.setErrorCallback((event, e) ->
+                log.error("事件 [{}] 的 handler 抛出异常: {}", event, e.getMessage()));
         this.objectMapper = new ObjectMapper();
         this.httpClient = new OkHttpClient.Builder()
                 .pingInterval(0, TimeUnit.SECONDS)
                 .build();
+        this.dispatchExecutor = Executors.newCachedThreadPool(r -> {
+            Thread t = new Thread(r, "wecom-aibot-dispatch");
+            t.setDaemon(true);
+            return t;
+        });
     }
 
     /**
@@ -90,10 +99,17 @@ public class WeComAiBotClient {
         this.options = options;
         this.log = logger != null ? logger : new AiBotLogger.Slf4jLogger();
         this.emitter = new EventEmitter();
+        this.emitter.setErrorCallback((event, e) ->
+                this.log.error("事件 [{}] 的 handler 抛出异常: {}", event, e.getMessage()));
         this.objectMapper = new ObjectMapper();
         this.httpClient = new OkHttpClient.Builder()
                 .pingInterval(0, TimeUnit.SECONDS)
                 .build();
+        this.dispatchExecutor = Executors.newCachedThreadPool(r -> {
+            Thread t = new Thread(r, "wecom-aibot-dispatch");
+            t.setDaemon(true);
+            return t;
+        });
     }
 
     // =========================================================================
@@ -361,8 +377,8 @@ public class WeComAiBotClient {
             }
         }
 
-        // 异步分发回调（带异常捕获，防止 handler 崩溃影响消息处理）
-        CompletableFuture.runAsync(() -> dispatch(frame));
+        // 异步分发回调（使用专用线程池，防止阻塞操作耗尽公共 ForkJoinPool）
+        dispatchExecutor.execute(() -> dispatch(frame));
     }
 
     /**
@@ -392,7 +408,15 @@ public class WeComAiBotClient {
 
     private void dispatchMessage(Frame frame) {
         try {
+            if (frame.getBody() == null) {
+                log.warn("消息回调 body 为空，跳过");
+                return;
+            }
             MsgCallbackBody body = objectMapper.treeToValue(frame.getBody(), MsgCallbackBody.class);
+            if (body == null) {
+                log.warn("消息回调解析结果为 null，跳过");
+                return;
+            }
             emitter.emit(Constants.EVENT_MESSAGE, frame, body);
 
             if (body.getMsgType() != null) {
@@ -426,7 +450,15 @@ public class WeComAiBotClient {
 
     private void dispatchEvent(Frame frame) {
         try {
+            if (frame.getBody() == null) {
+                log.warn("事件回调 body 为空，跳过");
+                return;
+            }
             EventCallbackBody body = objectMapper.treeToValue(frame.getBody(), EventCallbackBody.class);
+            if (body == null) {
+                log.warn("事件回调解析结果为 null，跳过");
+                return;
+            }
             emitter.emit(Constants.EVENT_EVENT, frame, body);
 
             if (body.getEvent() != null && body.getEvent().getEventType() != null) {
@@ -511,6 +543,10 @@ public class WeComAiBotClient {
         } catch (ExecutionException e) {
             pending.remove(reqId);
             throw new IOException("等待响应失败: " + e.getCause().getMessage(), e.getCause());
+        } catch (InterruptedException e) {
+            pending.remove(reqId);
+            Thread.currentThread().interrupt(); // 保留中断标记
+            throw e;
         }
     }
 
@@ -683,6 +719,9 @@ public class WeComAiBotClient {
         running = false;
         closeConn();
         stopHeartbeat();
+        dispatchExecutor.shutdownNow();
+        httpClient.dispatcher().executorService().shutdown();
+        httpClient.connectionPool().evictAll();
     }
 
     /**

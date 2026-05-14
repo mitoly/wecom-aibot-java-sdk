@@ -6,6 +6,7 @@ import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BiConsumer;
 
 /**
  * 线程安全的事件总线。
@@ -45,6 +46,17 @@ public class EventEmitter {
             = new java.util.concurrent.ConcurrentHashMap<>();
     private final AtomicLong nextId = new AtomicLong(0);
 
+    // 异常回调（用于 handler 抛异常时通知调用方记录日志）
+    private volatile BiConsumer<String, Exception> errorCallback;
+
+    /**
+     * 设置异常回调，当 handler 抛出异常时调用。
+     * 参数为 (事件名, 异常)。
+     */
+    public void setErrorCallback(BiConsumer<String, Exception> callback) {
+        this.errorCallback = callback;
+    }
+
     /**
      * 注册指定事件的处理函数，返回一个可取消注册的 Disposable。
      * 多次调用 dispose() 是安全的（幂等）。
@@ -78,8 +90,15 @@ public class EventEmitter {
             try {
                 entry.handler.handle(frame, payload);
             } catch (Exception e) {
-                // 防止单个 handler 异常影响其他 handler
-                // 调用方应在外层处理
+                // 记录异常，防止静默丢失错误信息
+                BiConsumer<String, Exception> cb = errorCallback;
+                if (cb != null) {
+                    try {
+                        cb.accept(event, e);
+                    } catch (Exception ignored) {
+                        // 避免回调自身异常导致循环
+                    }
+                }
             }
         }
     }
