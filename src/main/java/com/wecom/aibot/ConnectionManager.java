@@ -231,7 +231,7 @@ final class ConnectionManager implements AutoCloseable {
             try {
                 if (clock.getAsLong()>=item.deadline) throw error(AiBotException.Code.DEADLINE_EXCEEDED,"回复窗口已过期");
                 long startedAt=registry.startedAt(item.streamKey);
-                if (startedAt!=0 && clock.getAsLong()-startedAt>=TimeUnit.MINUTES.toNanos(10)) throw error(AiBotException.Code.DEADLINE_EXCEEDED,"流刷新超过十分钟");
+                if (startedAt!=0 && clock.getAsLong()-startedAt>=TimeUnit.MILLISECONDS.toNanos(Constants.STREAM_MAX_DURATION_MS)) throw error(AiBotException.Code.DEADLINE_EXCEEDED,"流刷新超过十分钟");
                 if(startedAt!=0 && item.body.path("stream").has("feedback"))log.warn("流式续帧携带 feedback（官方未限制首帧，放行发送）: {}",item.streamKey);
                 if (item.target!=null) messages.acquire(item.target);
                 if (Constants.CMD_UPLOAD_MEDIA_INIT.equals(item.cmd)) uploads.acquire(options.getBotId());
@@ -281,7 +281,9 @@ final class ConnectionManager implements AutoCloseable {
         if(s.socket!=null)s.socket.cancel();
         for(Deque<Envelope> queue:s.lanes.values()) for(Envelope item:queue) {
             cancel(item.timeout);
-            complete(item,null,item.sent ? new AiBotException(AiBotException.Code.UNKNOWN,"连接中断，发送结果未知",cause) : cause);
+            // 帧已写出而 ACK 未回：结果未知，毒化 req_id 跨连接禁续发（与 ACK 超时同口径，防重复发送）
+            if(item.sent)registry.markPoisoned(item.reqId);
+            complete(item,null,item.sent ? new AiBotException(AiBotException.Code.UNKNOWN,"连接中断，发送结果未知；该 req_id 已禁止续发",cause) : cause);
         }
         s.lanes.clear(); event.accept(Constants.EVENT_DISCONNECTED,cause);
         if(closed.get() || terminal(state))return;

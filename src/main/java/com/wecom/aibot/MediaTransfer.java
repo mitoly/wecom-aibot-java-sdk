@@ -127,8 +127,13 @@ final class MediaTransfer implements AutoCloseable {
                 } else if(cause instanceof AiBotException) {
                     AiBotException.Code code=((AiBotException)cause).getCode();
                     retryable=code==AiBotException.Code.NOT_READY||code==AiBotException.Code.UNKNOWN||code==AiBotException.Code.SEND_FAILED||code==AiBotException.Code.SERVER_REJECTED;
-                } else retryable=e instanceof TimeoutException;
-                if(!retryable)throw e;
+                } else retryable=false;
+                if(!retryable) {
+                    // finish 语义下非 AiBotException 的失败同样结果不确定：统一给出重传指引
+                    if(finishSemantics && !(cause instanceof AiBotException))
+                        throw new AiBotException(AiBotException.Code.UNKNOWN,"finish 失败且结果不确定：上传可能已在服务端完成，建议整文件重传",cause);
+                    throw e;
+                }
                 if(attempt>=options.getMaxChunkRetries())throw e;
                 long remaining=deadline-System.nanoTime();if(remaining<=0)throw new AiBotException(AiBotException.Code.DEADLINE_EXCEEDED,"上传会话已过期");
                 log.warn("媒体帧发送失败进入重试（第{}次，命令={}，原因={})",attempt+1,cmd,cause.getMessage());

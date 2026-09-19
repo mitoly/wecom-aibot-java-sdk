@@ -24,18 +24,20 @@ import java.util.concurrent.ConcurrentHashMap;
  * req_id 维度跨连接记录——ACK 结果未知的 req_id 禁止续发，重连不豁免（防重复发送）。
  */
 final class StreamRegistry {
-    /** 不可变流状态条目；startedAt=0 表示尚未写过 socket。 */
+    /** 不可变流状态条目；startedAt=0 表示尚未写过 socket，10 分钟流窗口由 startedAt+Constants.STREAM_MAX_DURATION_MS 推导。 */
     static final class Entry {
         final long startedAt;
-        final long streamExpiresAt;
         final long replyDeadline;
         final boolean finishing;
         final boolean finished;
-        Entry(long startedAt, long streamExpiresAt, long replyDeadline, boolean finishing, boolean finished) {
-            this.startedAt=startedAt; this.streamExpiresAt=streamExpiresAt; this.replyDeadline=replyDeadline;
+        Entry(long startedAt, long replyDeadline, boolean finishing, boolean finished) {
+            this.startedAt=startedAt; this.replyDeadline=replyDeadline;
             this.finishing=finishing; this.finished=finished;
         }
     }
+
+    /** 流 key 的唯一编码点（StreamSession 与 admit 共用，防止格式漂移）。 */
+    static String key(String reqId,String streamId) { return reqId+":"+streamId; }
 
     private final ConcurrentHashMap<String,Entry> streams=new ConcurrentHashMap<>();
     private final Set<String> poisoned=ConcurrentHashMap.newKeySet();
@@ -50,16 +52,16 @@ final class StreamRegistry {
      */
     String admit(String reqId, JsonNode body, long deadline) throws AiBotException {
         if(body==null || !"stream".equals(body.path("msgtype").asText()))return null;
-        String key=reqId+":"+body.path("stream").path("id").asText();
+        String key=key(reqId,body.path("stream").path("id").asText());
         Entry current=streams.get(key);
         if(current==null) {
             if(active>=maxActive)throw new AiBotException(AiBotException.Code.QUEUE_FULL,"流会话容量已满");
-            current=new Entry(0,0,deadline,false,false);
+            current=new Entry(0,deadline,false,false);
             streams.put(key,current);active++;
         }
         if(current.finishing||current.finished)throw new AiBotException(AiBotException.Code.INVALID_ARGUMENT,"流已结束或正在结束");
         if(body.path("stream").path("finish").asBoolean())
-            streams.put(key,new Entry(current.startedAt,current.streamExpiresAt,current.replyDeadline,true,current.finished));
+            streams.put(key,new Entry(current.startedAt,current.replyDeadline,true,current.finished));
         return key;
     }
 
@@ -68,7 +70,7 @@ final class StreamRegistry {
         if(key==null)return;
         Entry current=streams.get(key);
         if(current==null||current.startedAt!=0)return;
-        streams.put(key,new Entry(now,now+ java.util.concurrent.TimeUnit.MINUTES.toNanos(10),current.replyDeadline,current.finishing,current.finished));
+        streams.put(key,new Entry(now,current.replyDeadline,current.finishing,current.finished));
     }
 
     /** pump 发送失败回退 finishing（终帧未发出，流仍可续）。 */
@@ -76,7 +78,7 @@ final class StreamRegistry {
         if(key==null)return;
         Entry current=streams.get(key);
         if(current==null||!current.finishing)return;
-        streams.put(key,new Entry(current.startedAt,current.streamExpiresAt,current.replyDeadline,false,current.finished));
+        streams.put(key,new Entry(current.startedAt,current.replyDeadline,false,current.finished));
     }
 
     /**
@@ -88,10 +90,10 @@ final class StreamRegistry {
         Entry current=streams.get(key);
         if(current==null)return;
         if(accepted) {
-            streams.put(key,new Entry(current.startedAt,current.streamExpiresAt,current.replyDeadline,false,true));
+            streams.put(key,new Entry(current.startedAt,current.replyDeadline,false,true));
             if(!current.finished)active--;
         } else if(current.finishing||current.finished) {
-            streams.put(key,new Entry(current.startedAt,current.streamExpiresAt,current.replyDeadline,false,false));
+            streams.put(key,new Entry(current.startedAt,current.replyDeadline,false,false));
         }
     }
 

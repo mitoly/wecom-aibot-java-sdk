@@ -39,7 +39,7 @@ public class StreamSession {
     public CompletionStage<Frame> finishAsync(String content){return enqueue(content,true);}
     public void update(String content) throws IOException {SdkFutures.awaitIo(updateAsync(content));}
     public void finish(String content) throws IOException {SdkFutures.awaitIo(finishAsync(content));}
-    private String key(){return frame.getHeaders()!=null&&frame.getHeaders().getReqId()!=null?frame.getHeaders().getReqId()+":"+streamId:null;}
+    private String key(){return frame.getHeaders()!=null&&frame.getHeaders().getReqId()!=null?StreamRegistry.key(frame.getHeaders().getReqId(),streamId):null;}
     private CompletionStage<Frame> enqueue(String content,boolean finish) {
         synchronized(lock) {
             if(getState()!=State.OPEN)return SdkFutures.failed(new IllegalStateException("流不可更新: "+getState()));
