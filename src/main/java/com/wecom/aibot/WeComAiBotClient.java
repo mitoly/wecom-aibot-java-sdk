@@ -25,6 +25,7 @@ public class WeComAiBotClient implements AutoCloseable {
     private final ConnectionManager connection;
     private final MediaTransfer media;
     private final java.util.concurrent.atomic.AtomicLong rejectedCallbacks=new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.function.LongSupplier clock=System::nanoTime;
 
     public WeComAiBotClient(Options options) throws IOException {this(options,null);}
     public WeComAiBotClient(Options options,AiBotLogger logger) throws IOException {
@@ -34,7 +35,7 @@ public class WeComAiBotClient implements AutoCloseable {
                 new ArrayBlockingQueue<>(this.options.getCallbackQueueSize()),ConnectionManager.threadFactory("wecom-callback"),new ThreadPoolExecutor.AbortPolicy());
         emitter.setErrorCallback((event,error) -> log.error("事件处理失败: {}",event,error));
         OkHttpClient http=new OkHttpClient.Builder().connectTimeout(this.options.getConnectTimeoutMs(),TimeUnit.MILLISECONDS).pingInterval(0,TimeUnit.SECONDS).build();
-        connection=new ConnectionManager(this.options,mapper,http,this::emit,this::dispatch,http::newWebSocket,System::nanoTime,log);
+        connection=new ConnectionManager(this.options,mapper,http,this::emit,this::dispatch,http::newWebSocket,clock,log);
         media=new MediaTransfer(this,this.options);
         connection.termination().whenComplete((value,error) -> callbacks.shutdown());
     }
@@ -193,6 +194,8 @@ public class WeComAiBotClient implements AutoCloseable {
     public StreamSession newStreamWithId(Frame callback,String id) {return new StreamSession(this,callback,id,log);}
     ObjectMapper getObjectMapper() {return mapper;}
     AiBotLogger logger() {return log;}
+    StreamRegistry streamRegistry() {return connection.registry();}
+    java.util.function.LongSupplier clockSource() {return clock;}
     void awaitReady(long deadline) throws IOException,InterruptedException {connection.awaitReady(deadline);}
     Options options() {return options;}
     /** 幂等终态关闭；取消媒体任务及连接，不隐式重放已发消息。 */

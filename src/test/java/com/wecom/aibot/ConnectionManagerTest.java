@@ -147,4 +147,43 @@ public class ConnectionManagerTest {
             socket.ack(sent);followUp.toCompletableFuture().get(2,TimeUnit.SECONDS);
         }finally{manager.close();}
     }
+
+    @Test public void streamWindowKeepsCountingAcrossReconnect() throws Exception {
+        java.util.concurrent.atomic.AtomicLong clock=new java.util.concurrent.atomic.AtomicLong(1);
+        BlockingQueue<Socket> created=new LinkedBlockingQueue<>();
+        ConnectionManager manager=new ConnectionManager(new Options().setReconnectBaseDelayMs(10).setReconnectMaxDelayMs(20),mapper,new OkHttpClient(),(event,payload)->{},frame->{},
+            (request,listener)->{Socket socket=new Socket(listener);created.add(socket);listener.onOpen(socket,null);return socket;},clock::get);
+        try {
+            manager.start().toCompletableFuture().get(2,TimeUnit.SECONDS);Socket first=created.poll(2,TimeUnit.SECONDS);
+            CompletionStage<Frame> head=manager.request(Constants.CMD_RESPOND_MSG,"r",streamFrame("s",false,false),"u",manager.generation(),Long.MAX_VALUE);
+            first.ack(first.frames.poll(2,TimeUnit.SECONDS));head.toCompletableFuture().get(2,TimeUnit.SECONDS);
+            clock.addAndGet(TimeUnit.MINUTES.toNanos(5));
+            first.listener.onFailure(first,new java.io.IOException("drop"),null);
+            Socket second=created.poll(2,TimeUnit.SECONDS);assertNotNull(second);
+            long until=System.nanoTime()+TimeUnit.SECONDS.toNanos(2);while(manager.state()!=BotConnectionState.READY&&System.nanoTime()<until)Thread.sleep(5);
+            assertEquals(BotConnectionState.READY,manager.state());
+            // 10 分钟流窗口跨连接连续计时（旧实现挂在连接代上，重连即清零重新起算）
+            clock.addAndGet(TimeUnit.MINUTES.toNanos(6));
+            CompletionStage<Frame> late=manager.request(Constants.CMD_RESPOND_MSG,"r",streamFrame("s",false,false),"u",manager.generation(),Long.MAX_VALUE);
+            try{late.toCompletableFuture().get(1,TimeUnit.SECONDS);fail();}catch(ExecutionException e){assertEquals(AiBotException.Code.DEADLINE_EXCEEDED,((AiBotException)SdkFutures.unwrap(e)).getCode());}
+        }finally{manager.close();}
+    }
+
+    @Test public void poisonedReqIdStaysForbiddenAcrossReconnect() throws Exception {
+        BlockingQueue<Socket> created=new LinkedBlockingQueue<>();
+        ConnectionManager manager=new ConnectionManager(new Options().setReconnectBaseDelayMs(10).setReconnectMaxDelayMs(20).setReplyAckTimeoutMs(60),mapper,new OkHttpClient(),(event,payload)->{},frame->{},
+            (request,listener)->{Socket socket=new Socket(listener);created.add(socket);listener.onOpen(socket,null);return socket;});
+        try {
+            manager.start().toCompletableFuture().get(2,TimeUnit.SECONDS);Socket first=created.poll(2,TimeUnit.SECONDS);
+            CompletionStage<Frame> pending=manager.request(Constants.CMD_RESPOND_MSG,"p",streamFrame("s",false,false),"u",manager.generation(),Long.MAX_VALUE);
+            assertNotNull(first.frames.poll(2,TimeUnit.SECONDS)); // 写出但不 ACK：等待 poison
+            try{pending.toCompletableFuture().get(2,TimeUnit.SECONDS);fail();}catch(ExecutionException e){assertEquals(AiBotException.Code.UNKNOWN,((AiBotException)SdkFutures.unwrap(e)).getCode());}
+            first.listener.onFailure(first,new java.io.IOException("drop"),null);
+            Socket second=created.poll(2,TimeUnit.SECONDS);assertNotNull(second);
+            long until=System.nanoTime()+TimeUnit.SECONDS.toNanos(2);while(manager.state()!=BotConnectionState.READY&&System.nanoTime()<until)Thread.sleep(5);
+            // ACK 结果未知的 req_id 跨连接仍禁止续发（旧实现 poisoned 挂连接代，重连即清零放行）
+            CompletionStage<Frame> retry=manager.request(Constants.CMD_RESPOND_MSG,"p",streamFrame("s",false,false),"u",manager.generation(),Long.MAX_VALUE);
+            try{retry.toCompletableFuture().get(1,TimeUnit.SECONDS);fail();}catch(ExecutionException e){assertEquals(AiBotException.Code.UNKNOWN,((AiBotException)SdkFutures.unwrap(e)).getCode());}
+        }finally{manager.close();}
+    }
 }
