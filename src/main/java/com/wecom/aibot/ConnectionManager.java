@@ -126,7 +126,8 @@ final class ConnectionManager implements AutoCloseable {
                 @Override public void onOpen(WebSocket ws, Response response) { execute(() -> opened(s,ws)); }
                 @Override public void onMessage(WebSocket ws, String text) { execute(() -> receive(s,text)); }
                 @Override public void onFailure(WebSocket ws, Throwable t, Response response) {
-                    execute(() -> end(s,error(AiBotException.Code.NOT_READY,"WebSocket 连接中断"),state==BotConnectionState.AUTHENTICATING));
+                    // 网络中断即使发生在认证等待期也走 reconnect 预算：仅订阅 ACK 明确拒绝（errcode!=0）才计入 authFailures。
+                    execute(() -> end(s,error(AiBotException.Code.NOT_READY,"WebSocket 连接中断"),false));
                 }
                 @Override public void onClosing(WebSocket ws, int code, String reason) {
                     ws.close(code,reason); execute(() -> end(s,error(AiBotException.Code.NOT_READY,"服务端关闭连接"),false));
@@ -143,7 +144,7 @@ final class ConnectionManager implements AutoCloseable {
         cancel(s.connectTimeout); s.socket=ws; transition(BotConnectionState.AUTHENTICATING);
         s.authId=WeComAiBotClient.generateReqId(Constants.CMD_SUBSCRIBE);
         Map<String,String> credentials=new HashMap<>(); credentials.put("bot_id",options.getBotId()); credentials.put("secret",options.getSecret());
-        s.authTimeout=lifecycle.schedule(() -> end(s,error(AiBotException.Code.UNKNOWN,"认证响应超时"),true),options.getRequestTimeoutMs(),TimeUnit.MILLISECONDS);
+        s.authTimeout=lifecycle.schedule(() -> end(s,error(AiBotException.Code.UNKNOWN,"认证响应超时"),false),options.getRequestTimeoutMs(),TimeUnit.MILLISECONDS);
         try {
             write(s,new Frame(Constants.CMD_SUBSCRIBE,new Headers(s.authId),mapper.valueToTree(credentials)));
             event.accept(Constants.EVENT_CONNECTED,null);
@@ -249,8 +250,10 @@ final class ConnectionManager implements AutoCloseable {
                 if(item.stream!=null && item.stream.started!=0 && item.body.path("stream").has("feedback"))log.warn("流式续帧携带 feedback（官方未限制首帧，放行发送）: {}",item.streamKey);
                 if (item.target!=null) messages.acquire(item.target);
                 if (Constants.CMD_UPLOAD_MEDIA_INIT.equals(item.cmd)) uploads.acquire(options.getBotId());
-                long timeout=replyCommand(item.cmd) ? options.getReplyAckTimeoutMs() : options.getRequestTimeoutMs();
-                item.timeout=lifecycle.schedule(() -> poison(s,item,error(AiBotException.Code.UNKNOWN,"ACK 超时，发送结果未知")),timeout,TimeUnit.MILLISECONDS);
+                // ACK 等待不超过剩余回复窗口：welcome/卡片更新类 5 秒窗口过期后无需傻等完整 replyAckTimeoutMs
+                long windowMs=TimeUnit.NANOSECONDS.toMillis(Math.max(0,item.deadline-clock.getAsLong()));
+                long timeout=replyCommand(item.cmd) ? Math.max(1,Math.min(options.getReplyAckTimeoutMs(),windowMs)) : options.getRequestTimeoutMs();
+                item.timeout=lifecycle.schedule(() -> poison(s,item,error(AiBotException.Code.UNKNOWN,"ACK 超时，发送结果未知；该 req_id 已禁止续发，继续回复需等待新回调")),timeout,TimeUnit.MILLISECONDS);
                 long sentAt=clock.getAsLong();
                 write(s,new Frame(item.cmd,new Headers(item.reqId),item.body)); item.sent=true;
                 if(item.stream!=null && item.stream.started==0)item.stream.started=sentAt;
@@ -296,7 +299,7 @@ final class ConnectionManager implements AutoCloseable {
             cancel(item.timeout);
             complete(item,null,item.sent ? new AiBotException(AiBotException.Code.UNKNOWN,"连接中断，发送结果未知",cause) : cause);
         }
-        s.lanes.clear(); event.accept(Constants.EVENT_DISCONNECTED,cause); event.accept(Constants.EVENT_ERROR,cause);
+        s.lanes.clear(); event.accept(Constants.EVENT_DISCONNECTED,cause);
         if(closed.get() || terminal(state))return;
         int attempt=authFailure?++authFailures:++reconnectAttempts;
         int max=authFailure?options.getMaxAuthFailureAttempts():options.getMaxReconnectAttempts();

@@ -56,13 +56,18 @@ public class WeComAiBotClient implements AutoCloseable {
         catch(ExecutionException e){log.warn("客户端进入终态: {}",getState());}
         catch(InterruptedException e){close();Thread.currentThread().interrupt();throw e;}
     }
-    private void callback(Runnable action) {
+    private void callback(Frame frame,Runnable action) {
         try {callbacks.execute(action);}
-        catch(RejectedExecutionException e) {rejectedCallbacks.incrementAndGet();log.error("回调队列已满或客户端关闭；请检查 getRejectedCallbackCount");}
+        catch(RejectedExecutionException e) {
+            rejectedCallbacks.incrementAndGet();log.error("回调队列已满或客户端关闭；请检查 getRejectedCallbackCount");
+            // 逐条可见化被丢的回调（含 msgid），不再只有汇总计数；emit 同步执行，不经 callbacks，不会递归。
+            String msgid=frame!=null&&frame.getBody()!=null?frame.getBody().path("msgid").asText():null;
+            emitter.emit(Constants.EVENT_ERROR,frame,new AiBotException(AiBotException.Code.QUEUE_FULL,"回调队列已满，回调已丢弃"+(msgid==null||msgid.isEmpty()?"":"（msgid="+msgid+"）")));
+        }
     }
-    private void emit(String event,Object payload) {callback(() -> emitter.emit(event,null,payload));}
+    private void emit(String event,Object payload) {callback(null,() -> emitter.emit(event,null,payload));}
     private void dispatch(Frame frame) {
-        callback(() -> {
+        callback(frame,() -> {
             try {
                 if(Constants.CMD_MSG_CALLBACK.equals(frame.getCmd())) {
                     MsgCallbackBody body=mapper.treeToValue(frame.getBody(),MsgCallbackBody.class);
@@ -187,6 +192,7 @@ public class WeComAiBotClient implements AutoCloseable {
     public StreamSession newStream(Frame callback) {return newStreamWithId(callback,generateReqId("stream"));}
     public StreamSession newStreamWithId(Frame callback,String id) {return new StreamSession(this,callback,id,log);}
     ObjectMapper getObjectMapper() {return mapper;}
+    AiBotLogger logger() {return log;}
     void awaitReady(long deadline) throws IOException,InterruptedException {connection.awaitReady(deadline);}
     Options options() {return options;}
     /** 幂等终态关闭；取消媒体任务及连接，不隐式重放已发消息。 */

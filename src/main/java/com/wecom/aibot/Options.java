@@ -36,7 +36,8 @@ public class Options {
     private long requestTimeoutMs = Constants.DEFAULT_REQUEST_TIMEOUT_MS;
 
     private long connectTimeoutMs = 10000L;
-    private long replyAckTimeoutMs = 5000L;
+    // 回复 ACK 等待上限：超时即毒化 req_id（不可恢复），默认取宽（服务端慢波动不至截断流式回复）；联调后按实测 p99 复核
+    private long replyAckTimeoutMs = 15000L;
     private int maxAuthFailureAttempts = 5;
     private int maxMissedHeartbeats = 3;
     private int maxReplyQueueSize = 32;
@@ -176,6 +177,10 @@ public class Options {
         return maxReconnectAttempts;
     }
 
+    /**
+     * 最大重连次数：-1 表示无限重连，0 表示断线一次即进入 FAILED 终态（不重连）。
+     * 注意与旧版（1.1.0 之前）语义不同：旧版 0/负数均表示无限重连。
+     */
     public Options setMaxReconnectAttempts(int maxReconnectAttempts) {
         this.maxReconnectAttempts = maxReconnectAttempts;
         return this;

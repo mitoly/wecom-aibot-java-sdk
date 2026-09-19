@@ -14,30 +14,38 @@ import java.util.concurrent.atomic.AtomicInteger;
 final class MediaTransfer implements AutoCloseable {
     private final WeComAiBotClient client;
     private final Options options;
-    private final ExecutorService io=Executors.newFixedThreadPool(4,ConnectionManager.threadFactory("wecom-media"));
+    private final AiBotLogger log;
+    // 下载/上传分池：慢下载不再饿死上传（原共享 4 槽时 4 个慢下载可封死全部上传）
+    private final ExecutorService downloads=Executors.newFixedThreadPool(4,ConnectionManager.threadFactory("wecom-media-download"));
+    private final ExecutorService uploads=Executors.newFixedThreadPool(4,ConnectionManager.threadFactory("wecom-media-upload"));
     private final ExecutorService chunks;
-    private final Map<CompletableFuture<?>, Future<?>> tasks=new HashMap<>();
+    private final Map<CompletableFuture<?>, Future<?>> downloadTasks=new HashMap<>();
+    private final Map<CompletableFuture<?>, Future<?>> uploadTasks=new HashMap<>();
     private boolean closed;
     MediaTransfer(WeComAiBotClient client,Options options) {
-        this.client=client;this.options=options;
+        this.client=client;this.options=options;this.log=client.logger();
         chunks=Executors.newFixedThreadPool(options.getUploadChunkConcurrency(),ConnectionManager.threadFactory("wecom-chunk"));
     }
-    private synchronized <T> CompletionStage<T> submit(Callable<T> work) {
+    private synchronized <T> CompletionStage<T> submit(ExecutorService pool,Map<CompletableFuture<?>, Future<?>> registry,Callable<T> work,long maxQueueNanos) {
         if(closed)return SdkFutures.failed(new AiBotException(AiBotException.Code.CLOSED,"媒体传输已关闭"));
-        if(tasks.size()>=4)return SdkFutures.failed(new AiBotException(AiBotException.Code.QUEUE_FULL,"媒体任务容量已满"));
+        if(registry.size()>=4)return SdkFutures.failed(new AiBotException(AiBotException.Code.QUEUE_FULL,"媒体任务容量已满"));
         CompletableFuture<T> result=new CompletableFuture<>();
+        long enqueuedAt=System.nanoTime();
         // 在运行前登记任务，避免极快任务先结束再入表。
         FutureTask<Void> task=new FutureTask<>(() -> {
-            try {result.complete(work.call());}catch(Throwable error){result.completeExceptionally(SdkFutures.unwrap(error));}
-            finally {synchronized(MediaTransfer.this){tasks.remove(result);}}
+            try {
+                if(maxQueueNanos>0 && System.nanoTime()-enqueuedAt>maxQueueNanos)throw new AiBotException(AiBotException.Code.DEADLINE_EXCEEDED,"下载排队超过回调媒体 url 有效期（官方 5 分钟），url 可能已过期");
+                result.complete(work.call());
+            }catch(Throwable error){result.completeExceptionally(SdkFutures.unwrap(error));}
+            finally {synchronized(MediaTransfer.this){registry.remove(result);}}
             return null;
         });
-        tasks.put(result,task);io.execute(task);return result;
+        registry.put(result,task);pool.execute(task);return result;
     }
     CompletionStage<UploadedMedia> upload(String type,String filename,byte[] data) {
         try {
             if(data==null)ProtocolValidator.invalid("文件数据为空");validateUpload(type,filename,data.length);
-            byte[] snapshot=data.clone();return submit(() -> transfer(type,filename,snapshot));
+            byte[] snapshot=data.clone();return submit(uploads,uploadTasks,() -> transfer(type,filename,snapshot),0);
         }catch(Exception e){return SdkFutures.failed(e);}
     }
     CompletionStage<UploadedMedia> upload(String type,Path path) {
@@ -47,7 +55,7 @@ final class MediaTransfer implements AutoCloseable {
             Path fileName=path.getFileName();
             if(fileName==null)ProtocolValidator.invalid("文件路径无效: "+path);
             validateUploadMeta(type,fileName.toString());
-            return submit(() -> {
+            return submit(uploads,uploadTasks,() -> {
                 byte[] bytes;
                 try(java.io.InputStream in=Files.newInputStream(path);java.io.ByteArrayOutputStream out=new java.io.ByteArrayOutputStream()) {
                     byte[] buffer=new byte[8192];int count;
@@ -55,11 +63,12 @@ final class MediaTransfer implements AutoCloseable {
                     bytes=out.toByteArray();
                 }
                 validateUpload(type,fileName.toString(),bytes.length);return transfer(type,fileName.toString(),bytes);
-            });
+            },0);
         }catch(Exception e){return SdkFutures.failed(e);}
     }
     CompletionStage<MediaUtils.DownloadResult> download(String url,String aesKey) {
-        return submit(() -> MediaUtils.downloadFile(url,aesKey,options.getMaxDownloadBytes(),timeout(options.getDownloadConnectTimeoutMs()),timeout(options.getDownloadReadTimeoutMs())));
+        // 官方回调媒体 url 仅 5 分钟有效：排队超龄直接失败，错误与网络故障可区分
+        return submit(downloads,downloadTasks,() -> MediaUtils.downloadFile(url,aesKey,options.getMaxDownloadBytes(),timeout(options.getDownloadConnectTimeoutMs()),timeout(options.getDownloadReadTimeoutMs())),TimeUnit.MINUTES.toNanos(5));
     }
     private static int timeout(long value){return (int)Math.min(Integer.MAX_VALUE,value);}
     private UploadedMedia transfer(String type,String filename,byte[] bytes) throws Exception {
@@ -89,24 +98,40 @@ final class MediaTransfer implements AutoCloseable {
         } catch(Exception e) {for(Future<?> worker:workers)worker.cancel(true);throw e;}
         client.awaitReady(deadline);
         if(deadline-System.nanoTime()<=0)throw new AiBotException(AiBotException.Code.DEADLINE_EXCEEDED,"上传会话已过期");
-        Frame finish=SdkFutures.awaitStrict(client.sendAsync(Constants.CMD_UPLOAD_MEDIA_FINISH,new UploadFinishBody(uploadId)));
+        // finish 幂等性官方未声明：仅确定未发出的失败可安全重试
+        Frame finish=sendWithRetry(Constants.CMD_UPLOAD_MEDIA_FINISH,new UploadFinishBody(uploadId),deadline,true);
         required(finish,"media_id");
         UploadedMedia result=client.getObjectMapper().treeToValue(finish.getBody(),UploadedMedia.class);
         if(result.getCreatedAt()==null||result.getType()==null)throw new AiBotException(AiBotException.Code.PROTOCOL_ERROR,"上传响应缺少 type/created_at");
         return result;
     }
     private void sendChunk(UploadChunkBody body,long deadline) throws Exception {
+        sendWithRetry(Constants.CMD_UPLOAD_MEDIA_CHUNK,body,deadline,false);
+    }
+    /**
+     * 媒体帧发送重试。finish 语义（幂等性官方未声明）：仅 NOT_READY/SEND_FAILED（帧确定未发出）重试，
+     * 结果未知（UNKNOWN）直接失败并明确告知上传可能已在服务端完成；chunk 语义：官方明确幂等，
+     * NOT_READY/UNKNOWN/SEND_FAILED/SERVER_REJECTED 均可安全重试。
+     */
+    private Frame sendWithRetry(String cmd,Object body,long deadline,boolean finishSemantics) throws Exception {
         for(int attempt=0;;attempt++) {
-            try {client.awaitReady(deadline);SdkFutures.awaitStrict(client.sendAsync(Constants.CMD_UPLOAD_MEDIA_CHUNK,body));return;}
+            try {client.awaitReady(deadline);return SdkFutures.awaitStrict(client.sendAsync(cmd,body));}
             catch(Exception e) {
                 if(Thread.currentThread().isInterrupted()||e instanceof InterruptedException)throw e;
                 Throwable cause=SdkFutures.unwrap(e);
-                if(cause instanceof AiBotException) {
+                boolean retryable;
+                if(finishSemantics) {
+                    if(cause instanceof AiBotException && ((AiBotException)cause).getCode()==AiBotException.Code.UNKNOWN)
+                        throw new AiBotException(AiBotException.Code.UNKNOWN,"finish 结果未知：上传可能已在服务端完成但 media_id 不可知，建议整文件重传",cause);
+                    retryable=cause instanceof AiBotException && (((AiBotException)cause).getCode()==AiBotException.Code.NOT_READY||((AiBotException)cause).getCode()==AiBotException.Code.SEND_FAILED);
+                } else if(cause instanceof AiBotException) {
                     AiBotException.Code code=((AiBotException)cause).getCode();
-                    if(code!=AiBotException.Code.NOT_READY && code!=AiBotException.Code.UNKNOWN && code!=AiBotException.Code.SEND_FAILED && code!=AiBotException.Code.SERVER_REJECTED)throw e;
-                } else if(!(e instanceof TimeoutException))throw e;
+                    retryable=code==AiBotException.Code.NOT_READY||code==AiBotException.Code.UNKNOWN||code==AiBotException.Code.SEND_FAILED||code==AiBotException.Code.SERVER_REJECTED;
+                } else retryable=e instanceof TimeoutException;
+                if(!retryable)throw e;
                 if(attempt>=options.getMaxChunkRetries())throw e;
                 long remaining=deadline-System.nanoTime();if(remaining<=0)throw new AiBotException(AiBotException.Code.DEADLINE_EXCEEDED,"上传会话已过期");
+                log.warn("媒体帧发送失败进入重试（第{}次，命令={}，原因={})",attempt+1,cmd,cause.getMessage());
                 TimeUnit.NANOSECONDS.sleep(Math.min(remaining,TimeUnit.MILLISECONDS.toNanos(500L*(attempt+1))));
             }
         }
@@ -137,9 +162,11 @@ final class MediaTransfer implements AutoCloseable {
     }
     @Override public synchronized void close() {
         if(closed)return;closed=true;
-        for(Map.Entry<CompletableFuture<?>,Future<?>> task:tasks.entrySet()) {
-            task.getValue().cancel(true);task.getKey().completeExceptionally(new AiBotException(AiBotException.Code.CLOSED,"媒体任务已取消；已发上传可能仍在服务端存在"));
+        for(Map<CompletableFuture<?>,Future<?>> registry:java.util.Arrays.asList(downloadTasks,uploadTasks)) {
+            for(Map.Entry<CompletableFuture<?>,Future<?>> task:registry.entrySet()) {
+                task.getValue().cancel(true);task.getKey().completeExceptionally(new AiBotException(AiBotException.Code.CLOSED,"媒体任务已取消；已发上传可能仍在服务端存在"));
+            }
         }
-        tasks.clear();io.shutdownNow();chunks.shutdownNow();
+        downloadTasks.clear();uploadTasks.clear();downloads.shutdownNow();uploads.shutdownNow();chunks.shutdownNow();
     }
 }

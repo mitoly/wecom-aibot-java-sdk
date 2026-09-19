@@ -218,6 +218,32 @@ public class ClientIntegrationTest {
         while(captured.get()==null&&System.nanoTime()<until)Thread.sleep(5);
         assertNotNull(captured.get());assertEquals("boom",captured.get().getMessage());
     }
+    @Test public void routineDisconnectEmitsDisconnectedButNotError() throws Exception {
+        upgrade();start(options().setMaxReconnectAttempts(0));
+        BlockingQueue<Object> disconnected=new LinkedBlockingQueue<>();AtomicInteger errors=new AtomicInteger();
+        client.on(Constants.EVENT_DISCONNECTED,(frame,payload)->disconnected.add(payload));
+        client.on(Constants.EVENT_ERROR,(frame,payload)->errors.incrementAndGet());
+        server.shutdown(); // 服务端关闭触发网络级中断，非用户主动 close
+        assertNotNull(disconnected.poll(3,TimeUnit.SECONDS));
+        Thread.sleep(120);assertEquals(0,errors.get()); // 断线归 disconnected，error 只留给异常性事件
+    }
+    @Test public void rejectedCallbackSurfacesPerMessageErrorEventWithMsgid() throws Exception {
+        upgrade();start(options().setCallbackThreads(1).setCallbackQueueSize(1));
+        CountDownLatch release=new CountDownLatch(1);
+        client.on(Constants.EVENT_MESSAGE_TEXT,(frame,body)->{try{release.await();}catch(InterruptedException ignored){}});
+        BlockingQueue<Object> errors=new LinkedBlockingQueue<>();
+        client.on(Constants.EVENT_ERROR,(frame,payload)->errors.add(payload));
+        // 3 条消息回调：第 1 条占线程、第 2 条占队列、第 3 条被拒——被拒条目逐条发 error（含 msgid）
+        for(String reqId:Arrays.asList("m1","m2","m3")) {
+            ObjectNode json=(ObjectNode)mapper.readTree(ProtocolModelTest.fixture("text-callback.json"));
+            ((ObjectNode)json.get("headers")).put("req_id",reqId);((ObjectNode)json.get("body")).put("msgid","msgid-"+reqId);
+            socket.get().send(json.toString());
+        }
+        Object error=errors.poll(3,TimeUnit.SECONDS);assertNotNull(error);
+        assertTrue(error instanceof AiBotException);assertTrue(((AiBotException)error).getMessage().contains("msgid"));
+        assertTrue(client.getRejectedCallbackCount()>=1);
+        release.countDown();
+    }
 
     @Test public void normalCloseDoesNotLookLikeCallbackOverloadAndRunInterruptCloses() throws Exception {
         upgrade();start(options());AtomicBoolean interrupted=new AtomicBoolean();
