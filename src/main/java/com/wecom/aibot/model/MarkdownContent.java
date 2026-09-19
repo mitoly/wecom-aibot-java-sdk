@@ -9,7 +9,7 @@ import com.fasterxml.jackson.annotation.JsonProperty;
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 @JsonInclude(JsonInclude.Include.NON_NULL)
-public class MarkdownContent {
+public class MarkdownContent extends ProtocolModel {
 
     @JsonProperty("content")
     private String content;
@@ -28,4 +28,7 @@ public class MarkdownContent {
     public void setContent(String content) {
         this.content = content;
     }
+    @JsonProperty("feedback") private ReplyFeedback feedback;
+    public ReplyFeedback getFeedback() { return feedback; }
+    public void setFeedback(ReplyFeedback value) { this.feedback = value; }
 }

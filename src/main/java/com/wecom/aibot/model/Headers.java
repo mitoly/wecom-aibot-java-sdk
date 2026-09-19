@@ -9,7 +9,7 @@ import com.fasterxml.jackson.annotation.JsonProperty;
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 @JsonInclude(JsonInclude.Include.NON_NULL)
-public class Headers {
+public class Headers extends ProtocolModel {
 
     @JsonProperty("req_id")
     private String reqId;

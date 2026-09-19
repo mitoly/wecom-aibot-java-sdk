@@ -1,0 +1,30 @@
+package com.wecom.aibot.model;
+
+import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.annotation.JsonProperty;
+
+/** 官方协议 CardImageTextArea 结构。 */
+@JsonInclude(JsonInclude.Include.NON_NULL)
+public class CardImageTextArea extends ProtocolModel {
+    @JsonProperty("type") private Integer type;
+    @JsonProperty("url") private String url;
+    @JsonProperty("appid") private String appId;
+    @JsonProperty("pagepath") private String pagePath;
+    @JsonProperty("title") private String title;
+    @JsonProperty("desc") private String desc;
+    @JsonProperty("image_url") private String imageUrl;
+    public Integer getType() { return type; }
+    public void setType(Integer value) { this.type = value; }
+    public String getUrl() { return url; }
+    public void setUrl(String value) { this.url = value; }
+    public String getAppId() { return appId; }
+    public void setAppId(String value) { this.appId = value; }
+    public String getPagePath() { return pagePath; }
+    public void setPagePath(String value) { this.pagePath = value; }
+    public String getTitle() { return title; }
+    public void setTitle(String value) { this.title = value; }
+    public String getDesc() { return desc; }
+    public void setDesc(String value) { this.desc = value; }
+    public String getImageUrl() { return imageUrl; }
+    public void setImageUrl(String value) { this.imageUrl = value; }
+}

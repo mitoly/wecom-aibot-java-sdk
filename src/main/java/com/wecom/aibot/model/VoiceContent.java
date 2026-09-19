@@ -9,7 +9,7 @@ import com.fasterxml.jackson.annotation.JsonProperty;
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 @JsonInclude(JsonInclude.Include.NON_NULL)
-public class VoiceContent {
+public class VoiceContent extends ProtocolModel {
 
     @JsonProperty("content")
     private String content;

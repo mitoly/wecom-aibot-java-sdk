@@ -1,10 +1,9 @@
 package com.wecom.aibot.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
-import com.fasterxml.jackson.annotation.JsonSetter;
-import com.fasterxml.jackson.annotation.Nulls;
 import com.fasterxml.jackson.databind.JsonNode;
 
 /**
@@ -12,7 +11,7 @@ import com.fasterxml.jackson.databind.JsonNode;
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 @JsonInclude(JsonInclude.Include.NON_NULL)
-public class Frame {
+public class Frame extends ProtocolModel {
 
     @JsonProperty("cmd")
     private String cmd;
@@ -26,6 +25,11 @@ public class Frame {
     @JsonProperty("errcode")
     @JsonInclude(JsonInclude.Include.NON_DEFAULT)
     private int errCode;
+
+    @JsonIgnore private boolean errCodePresent;
+    @JsonIgnore private long receivedNanos;
+    @JsonIgnore private long generation;
+    @JsonIgnore private String clientId;
 
     @JsonProperty("errmsg")
     private String errMsg;
@@ -69,6 +73,7 @@ public class Frame {
 
     public void setErrCode(int errCode) {
         this.errCode = errCode;
+        this.errCodePresent = true;
     }
 
     public String getErrMsg() {
@@ -77,5 +82,12 @@ public class Frame {
 
     public void setErrMsg(String errMsg) {
         this.errMsg = errMsg;
+    }
+    @JsonIgnore public boolean hasErrCode() { return errCodePresent; }
+    @JsonIgnore public long getReceivedNanos() { return receivedNanos; }
+    @JsonIgnore public long getGeneration() { return generation; }
+    @JsonIgnore public String getClientId() { return clientId; }
+    public void markReceived(long nanos, long generation, String clientId) {
+        this.receivedNanos=nanos; this.generation=generation; this.clientId=clientId;
     }
 }

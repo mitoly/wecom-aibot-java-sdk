@@ -9,7 +9,7 @@ import com.fasterxml.jackson.annotation.JsonProperty;
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 @JsonInclude(JsonInclude.Include.NON_NULL)
-public class Sender {
+public class Sender extends ProtocolModel {
 
     @JsonProperty("userid")
     private String userId;
@@ -28,4 +28,7 @@ public class Sender {
     public void setUserId(String userId) {
         this.userId = userId;
     }
+    @JsonProperty("corpid") private String corpId;
+    public String getCorpId() { return corpId; }
+    public void setCorpId(String value) { this.corpId = value; }
 }

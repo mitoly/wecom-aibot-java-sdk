@@ -9,7 +9,7 @@ import com.fasterxml.jackson.annotation.JsonProperty;
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 @JsonInclude(JsonInclude.Include.NON_NULL)
-public class StreamContent {
+public class StreamContent extends ProtocolModel {
 
     @JsonProperty("id")
     private String id;
@@ -52,4 +52,7 @@ public class StreamContent {
     public void setContent(String content) {
         this.content = content;
     }
+    @JsonProperty("feedback") private ReplyFeedback feedback;
+    public ReplyFeedback getFeedback() { return feedback; }
+    public void setFeedback(ReplyFeedback value) { this.feedback = value; }
 }

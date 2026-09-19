@@ -1,741 +1,192 @@
 package com.wecom.aibot;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.wecom.aibot.model.*;
-import okhttp3.*;
+import okhttp3.OkHttpClient;
 
 import java.io.IOException;
-import java.util.HashMap;
-import java.util.Map;
+import java.nio.file.Path;
+import java.util.List;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * 企业微信智能机器人 WebSocket 长连接客户端。
- * <p>
- * 功能：
- * <ul>
- *   <li>WebSocket 连接管理（自动重连、指数退避）</li>
- *   <li>身份认证（aibot_subscribe）</li>
- *   <li>心跳保活（fire-and-forget，不阻塞业务）</li>
- *   <li>消息/事件分发（事件总线）</li>
- *   <li>线程安全的消息发送与回复</li>
- * </ul>
- * <p>
- * 已修复的 Bug 防护：
- * <ul>
- *   <li>disconnected_event nil panic → closeConn() 幂等 + closeCh 通知</li>
- *   <li>Send() TOCTOU 竞态 → synchronized 块内原子检查+写入</li>
- *   <li>Event handler 注销错乱 → 唯一 ID + 幂等 dispose</li>
- *   <li>心跳阻塞 → fire-and-forget sendPing() 不走 pending 机制</li>
- *   <li>重连 attempt 不归零 → 连接持续 &gt; 1 分钟后重置</li>
- * </ul>
+ * 企业微信长连接客户端。异步发送只在有效 ACK 后成功；同步入口等待同一可靠核心。
+ * close/disconnect 是不可重启的终态。回调运行于独立有界执行器。
  */
-public class WeComAiBotClient {
-
+public class WeComAiBotClient implements AutoCloseable {
     private final Options options;
     private final AiBotLogger log;
-    private final EventEmitter emitter;
-    private final ObjectMapper objectMapper;
+    private final ObjectMapper mapper=new ObjectMapper();
+    private final EventEmitter emitter=new EventEmitter();
+    private final ThreadPoolExecutor callbacks;
+    private final ConnectionManager connection;
+    private final MediaTransfer media;
+    private final java.util.concurrent.atomic.AtomicLong rejectedCallbacks=new java.util.concurrent.atomic.AtomicLong();
 
-    // WebSocket 连接状态
-    private volatile WebSocket webSocket;
-    private final Object writeLock = new Object(); // 保护写操作，避免 TOCTOU 竞态
-    private final AtomicBoolean connected = new AtomicBoolean(false);
-    private volatile boolean closedByServer = false;
-
-    // 待处理的请求响应（req_id -> CompletableFuture）
-    private final ConcurrentHashMap<String, CompletableFuture<Frame>> pending = new ConcurrentHashMap<>();
-
-    // 心跳定时器
-    private ScheduledExecutorService heartbeatExecutor;
-
-    // 消息分发线程池（避免使用公共 ForkJoinPool，防止阻塞操作耗尽线程）
-    private final ExecutorService dispatchExecutor;
-
-    // 运行控制
-    private volatile boolean running = false;
-    private final Object runLock = new Object();
-
-    // OkHttp 客户端
-    private final OkHttpClient httpClient;
-
-    /**
-     * 创建 SDK 客户端。
-     *
-     * @param options 配置项
-     * @throws IOException 读取凭证文件失败
-     */
-    public WeComAiBotClient(Options options) throws IOException {
-        options.validate();
-        this.options = options;
-        this.log = new AiBotLogger.Slf4jLogger();
-        this.emitter = new EventEmitter();
-        this.emitter.setErrorCallback((event, e) ->
-                log.error("事件 [{}] 的 handler 抛出异常: {}", event, e.getMessage()));
-        this.objectMapper = new ObjectMapper();
-        this.httpClient = new OkHttpClient.Builder()
-                .pingInterval(0, TimeUnit.SECONDS)
-                .build();
-        this.dispatchExecutor = Executors.newCachedThreadPool(r -> {
-            Thread t = new Thread(r, "wecom-aibot-dispatch");
-            t.setDaemon(true);
-            return t;
-        });
+    public WeComAiBotClient(Options options) throws IOException {this(options,null);}
+    public WeComAiBotClient(Options options,AiBotLogger logger) throws IOException {
+        this.options=Objects.requireNonNull(options,"options").snapshot();
+        this.log=logger==null?new AiBotLogger.Slf4jLogger():logger;
+        callbacks=new ThreadPoolExecutor(this.options.getCallbackThreads(),this.options.getCallbackThreads(),0,TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue<>(this.options.getCallbackQueueSize()),ConnectionManager.threadFactory("wecom-callback"),new ThreadPoolExecutor.AbortPolicy());
+        emitter.setErrorCallback((event,error) -> log.error("事件处理失败: {}",event));
+        OkHttpClient http=new OkHttpClient.Builder().connectTimeout(this.options.getConnectTimeoutMs(),TimeUnit.MILLISECONDS).pingInterval(0,TimeUnit.SECONDS).build();
+        connection=new ConnectionManager(this.options,mapper,http,this::emit,this::dispatch);
+        media=new MediaTransfer(this,this.options);
+        connection.termination().whenComplete((value,error) -> callbacks.shutdown());
     }
-
-    /**
-     * 创建 SDK 客户端（自定义日志）。
-     *
-     * @param options 配置项
-     * @param logger  自定义日志实现
-     * @throws IOException 读取凭证文件失败
-     */
-    public WeComAiBotClient(Options options, AiBotLogger logger) throws IOException {
-        options.validate();
-        this.options = options;
-        this.log = logger != null ? logger : new AiBotLogger.Slf4jLogger();
-        this.emitter = new EventEmitter();
-        this.emitter.setErrorCallback((event, e) ->
-                this.log.error("事件 [{}] 的 handler 抛出异常: {}", event, e.getMessage()));
-        this.objectMapper = new ObjectMapper();
-        this.httpClient = new OkHttpClient.Builder()
-                .pingInterval(0, TimeUnit.SECONDS)
-                .build();
-        this.dispatchExecutor = Executors.newCachedThreadPool(r -> {
-            Thread t = new Thread(r, "wecom-aibot-dispatch");
-            t.setDaemon(true);
-            return t;
-        });
-    }
-
-    // =========================================================================
-    // 公共 API
-    // =========================================================================
-
-    /**
-     * 注册事件处理函数。
-     *
-     * @param event   事件名称（参见 {@link Constants} 中的 EVENT_* 常量）
-     * @param handler 处理函数
-     * @return 可取消注册的 Disposable
-     */
-    public EventEmitter.Disposable on(String event, EventEmitter.Handler handler) {
-        return emitter.on(event, handler);
-    }
-
-    /**
-     * 返回当前 WebSocket 是否已连接。
-     */
-    public boolean isConnected() {
-        return connected.get();
-    }
-
-    /**
-     * 生成唯一的请求 ID。
-     */
-    public static String generateReqId(String prefix) {
-        return prefix + "_" + UUID.randomUUID().toString().substring(0, 8);
-    }
-
-    // =========================================================================
-    // 连接生命周期
-    // =========================================================================
-
-    /**
-     * 建立连接并阻塞直到手动断开或超过最大重连次数。
-     * 自动处理断线重连。
-     *
-     * @throws InterruptedException 等待过程中被中断
-     */
+    /** 注册事件；返回值可幂等注销。请把耗时业务安排到调用方自己的执行器。 */
+    public EventEmitter.Disposable on(String event,EventEmitter.Handler handler) {return emitter.on(event,handler);}
+    /** 物理连接已经打开；业务发送应检查 getState()==READY。 */
+    public boolean isConnected() {return getState()==BotConnectionState.AUTHENTICATING || getState()==BotConnectionState.READY;}
+    public long getRejectedCallbackCount() {return rejectedCallbacks.get();}
+    public BotConnectionState getState() {return connection.state();}
+    public static String generateReqId(String prefix) {return prefix+"_"+UUID.randomUUID().toString();}
+    /** 首次认证成功时完成；后续连接变化通过生命周期事件报告。 */
+    public CompletionStage<Void> startAsync() {return connection.start();}
+    /** 阻塞运行至关闭/失败/被替代；被中断时统一关闭资源并保留中断标记。 */
     public void run() throws InterruptedException {
-        synchronized (runLock) {
-            if (running) {
-                throw new IllegalStateException("客户端已在运行中");
-            }
-            running = true;
-        }
-        try {
-            connectWithRetry();
-        } finally {
-            synchronized (runLock) {
-                running = false;
-            }
-        }
+        startAsync();
+        try {connection.termination().toCompletableFuture().get();}
+        catch(ExecutionException e){log.warn("客户端进入终态: {}",getState());}
+        catch(InterruptedException e){close();Thread.currentThread().interrupt();throw e;}
     }
-
-    /**
-     * 带重连的连接循环。
-     */
-    private void connectWithRetry() throws InterruptedException {
-        int attempt = 0;
-        while (running) {
-            long connectedAt = System.currentTimeMillis();
-            closedByServer = false;
-
-            try {
-                connect();
-                // connect() 正常返回说明连接已断开
-            } catch (Exception e) {
-                log.error("连接异常: {}", e.getMessage());
-            }
-
-            connected.set(false);
-
-            // 如果这次连接持续了超过 1 分钟，重置重连计数器
-            if (System.currentTimeMillis() - connectedAt > 60_000L) {
-                attempt = 0;
-            }
-
-            // 只在非服务端踢下线时触发 disconnected 事件（避免重复通知）
-            if (!closedByServer) {
-                emitter.emit(Constants.EVENT_DISCONNECTED, null, null);
-            }
-
-            if (!running) {
-                return;
-            }
-
-            attempt++;
-            if (options.getMaxReconnectAttempts() > 0 && attempt > options.getMaxReconnectAttempts()) {
-                log.error("超过最大重连次数 ({})", options.getMaxReconnectAttempts());
-                return;
-            }
-
-            long delay = backoff(attempt);
-            log.info("将在 {}ms 后重连 (第 {} 次)", delay, attempt);
-            emitter.emit(Constants.EVENT_RECONNECTING, null, attempt);
-
-            Thread.sleep(delay);
-        }
+    private void callback(Runnable action) {
+        try {callbacks.execute(action);}
+        catch(RejectedExecutionException e) {rejectedCallbacks.incrementAndGet();log.error("回调队列已满或客户端关闭；请检查 getRejectedCallbackCount");}
     }
-
-    /**
-     * 执行一次完整的连接流程：拨号 → 认证 → 心跳 → 等待断开。
-     */
-    private void connect() throws Exception {
-        CountDownLatch connectLatch = new CountDownLatch(1);
-        CountDownLatch closeLatch = new CountDownLatch(1);
-        AtomicBoolean connectSuccess = new AtomicBoolean(false);
-
-        Request request = new Request.Builder()
-                .url(options.getWsUrl())
-                .build();
-
-        webSocket = httpClient.newWebSocket(request, new WebSocketListener() {
-            @Override
-            public void onOpen(WebSocket ws, Response response) {
-                connected.set(true);
-                connectSuccess.set(true);
-                connectLatch.countDown();
-                emitter.emit(Constants.EVENT_CONNECTED, null, null);
-                log.info("已连接到 {}", options.getWsUrl());
-            }
-
-            @Override
-            public void onMessage(WebSocket ws, String text) {
-                handleMessage(text);
-            }
-
-            @Override
-            public void onFailure(WebSocket ws, Throwable t, Response response) {
-                log.error("WebSocket 连接失败: {}", t.getMessage());
-                connected.set(false);
-                connectLatch.countDown();
-                closeLatch.countDown();
-                cleanupPending();
-            }
-
-            @Override
-            public void onClosed(WebSocket ws, int code, String reason) {
-                log.info("WebSocket 已关闭: {} {}", code, reason);
-                connected.set(false);
-                closeLatch.countDown();
-                cleanupPending();
-            }
-        });
-
-        // 等待连接建立
-        connectLatch.await();
-        if (!connectSuccess.get()) {
-            throw new IOException("WebSocket 连接建立失败");
-        }
-
-        // 认证
-        authenticate();
-
-        // 启动心跳
-        startHeartbeat();
-
-        // 阻塞等待连接断开
-        closeLatch.await();
-
-        // 停止心跳
-        stopHeartbeat();
-    }
-
-    /**
-     * 发送订阅请求完成身份认证。
-     */
-    private void authenticate() throws Exception {
-        log.info("正在认证 (bot_id={}, secret={})", options.getBotId(), Options.maskSecret(options.getSecret()));
-
-        Map<String, String> body = new HashMap<>();
-        body.put("bot_id", options.getBotId());
-        body.put("secret", options.getSecret());
-
-        Frame resp = send(Constants.CMD_SUBSCRIBE, body);
-        if (resp.getErrCode() != 0) {
-            throw new IOException("订阅被拒绝: " + resp.getErrCode() + " " + resp.getErrMsg());
-        }
-        log.info("认证成功 (bot_id={})", options.getBotId());
-        emitter.emit(Constants.EVENT_AUTHENTICATED, null, null);
-    }
-
-    // =========================================================================
-    // 心跳保活
-    // =========================================================================
-
-    /**
-     * 启动心跳定时器。
-     * 心跳使用 fire-and-forget 方式，不等待响应。
-     */
-    private void startHeartbeat() {
-        heartbeatExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "wecom-aibot-heartbeat");
-            t.setDaemon(true);
-            return t;
-        });
-        heartbeatExecutor.scheduleAtFixedRate(() -> {
-            try {
-                sendPing();
-            } catch (Exception e) {
-                log.warn("心跳发送失败: {}", e.getMessage());
-            }
-        }, options.getHeartbeatIntervalMs(), options.getHeartbeatIntervalMs(), TimeUnit.MILLISECONDS);
-    }
-
-    private void stopHeartbeat() {
-        if (heartbeatExecutor != null && !heartbeatExecutor.isShutdown()) {
-            heartbeatExecutor.shutdownNow();
-            heartbeatExecutor = null;
-        }
-    }
-
-    /**
-     * 发送心跳帧（fire-and-forget，不等待响应）。
-     * 直接写帧，不走 pending 等待机制，避免心跳阻塞业务。
-     */
-    private void sendPing() {
-        Frame frame = new Frame();
-        frame.setCmd(Constants.CMD_PING);
-        frame.setHeaders(new Headers(generateReqId("ping")));
-
-        String json;
-        try {
-            json = objectMapper.writeValueAsString(frame);
-        } catch (JsonProcessingException e) {
-            log.error("序列化心跳帧失败: {}", e.getMessage());
-            return;
-        }
-
-        // 加锁检查 + 写入，原子操作避免 TOCTOU 竞态
-        synchronized (writeLock) {
-            WebSocket ws = webSocket;
-            if (ws == null || !connected.get()) {
-                return;
-            }
-            ws.send(json);
-        }
-    }
-
-    // =========================================================================
-    // 消息处理
-    // =========================================================================
-
-    /**
-     * 处理收到的 WebSocket 消息。
-     */
-    private void handleMessage(String text) {
-        Frame frame;
-        try {
-            frame = objectMapper.readValue(text, Frame.class);
-        } catch (Exception e) {
-            log.warn("帧解析失败: {}", e.getMessage());
-            return;
-        }
-
-        // 检查是否是待处理请求的响应
-        if (frame.getHeaders() != null && frame.getHeaders().getReqId() != null) {
-            CompletableFuture<Frame> future = pending.remove(frame.getHeaders().getReqId());
-            if (future != null) {
-                future.complete(frame);
-                return;
-            }
-        }
-
-        // 异步分发回调（使用专用线程池，防止阻塞操作耗尽公共 ForkJoinPool）
-        dispatchExecutor.execute(() -> dispatch(frame));
-    }
-
-    /**
-     * 根据命令类型分发帧到对应的事件处理函数。
-     * 使用 try-catch 包裹，防止单个 handler 异常导致崩溃。
-     */
+    private void emit(String event,Object payload) {callback(() -> emitter.emit(event,null,payload));}
     private void dispatch(Frame frame) {
-        try {
-            if (frame.getCmd() == null) {
-                return;
-            }
-            switch (frame.getCmd()) {
-                case Constants.CMD_MSG_CALLBACK:
-                    dispatchMessage(frame);
-                    break;
-                case Constants.CMD_EVENT_CALLBACK:
-                    dispatchEvent(frame);
-                    break;
-                default:
-                    break;
-            }
-        } catch (Exception e) {
-            log.error("处理函数发生异常: {}", e.getMessage());
-            emitter.emit(Constants.EVENT_ERROR, frame, e);
-        }
-    }
-
-    private void dispatchMessage(Frame frame) {
-        try {
-            if (frame.getBody() == null) {
-                log.warn("消息回调 body 为空，跳过");
-                return;
-            }
-            MsgCallbackBody body = objectMapper.treeToValue(frame.getBody(), MsgCallbackBody.class);
-            if (body == null) {
-                log.warn("消息回调解析结果为 null，跳过");
-                return;
-            }
-            emitter.emit(Constants.EVENT_MESSAGE, frame, body);
-
-            if (body.getMsgType() != null) {
-                switch (body.getMsgType()) {
-                    case Constants.MSG_TYPE_TEXT:
-                        emitter.emit(Constants.EVENT_MESSAGE_TEXT, frame, body);
-                        break;
-                    case Constants.MSG_TYPE_IMAGE:
-                        emitter.emit(Constants.EVENT_MESSAGE_IMAGE, frame, body);
-                        break;
-                    case Constants.MSG_TYPE_MIXED:
-                        emitter.emit(Constants.EVENT_MESSAGE_MIXED, frame, body);
-                        break;
-                    case Constants.MSG_TYPE_VOICE:
-                        emitter.emit(Constants.EVENT_MESSAGE_VOICE, frame, body);
-                        break;
-                    case Constants.MSG_TYPE_FILE:
-                        emitter.emit(Constants.EVENT_MESSAGE_FILE, frame, body);
-                        break;
-                    case Constants.MSG_TYPE_VIDEO:
-                        emitter.emit(Constants.EVENT_MESSAGE_VIDEO, frame, body);
-                        break;
-                    default:
-                        break;
+        callback(() -> {
+            try {
+                if(Constants.CMD_MSG_CALLBACK.equals(frame.getCmd())) {
+                    MsgCallbackBody body=mapper.treeToValue(frame.getBody(),MsgCallbackBody.class);
+                    emitter.emit(Constants.EVENT_MESSAGE,frame,body);
+                    emitter.emit("message."+body.getMsgType(),frame,body);
+                } else {
+                    EventCallbackBody body=mapper.treeToValue(frame.getBody(),EventCallbackBody.class);
+                    emitter.emit(Constants.EVENT_EVENT,frame,body);
+                    if(body.getEvent()!=null)emitter.emit("event."+body.getEvent().getEventType(),frame,body);
                 }
-            }
-        } catch (Exception e) {
-            log.warn("消息回调解析失败: {}", e.getMessage());
-        }
+            } catch(Exception e){emitter.emit(Constants.EVENT_ERROR,frame,new AiBotException(AiBotException.Code.PROTOCOL_ERROR,"回调解析失败"));}
+        });
     }
-
-    private void dispatchEvent(Frame frame) {
+    /** 高级发送入口；回调回复请使用 replyAsync，以便透传 req_id 与检查上下文。 */
+    public CompletionStage<Frame> sendAsync(String cmd,Object body) {
         try {
-            if (frame.getBody() == null) {
-                log.warn("事件回调 body 为空，跳过");
-                return;
-            }
-            EventCallbackBody body = objectMapper.treeToValue(frame.getBody(), EventCallbackBody.class);
-            if (body == null) {
-                log.warn("事件回调解析结果为 null，跳过");
-                return;
-            }
-            emitter.emit(Constants.EVENT_EVENT, frame, body);
-
-            if (body.getEvent() != null && body.getEvent().getEventType() != null) {
-                switch (body.getEvent().getEventType()) {
-                    case Constants.EVENT_TYPE_ENTER_CHAT:
-                        emitter.emit(Constants.EVENT_ENTER_CHAT, frame, body);
-                        break;
-                    case Constants.EVENT_TYPE_TEMPLATE_CARD:
-                        emitter.emit(Constants.EVENT_TEMPLATE_CARD, frame, body);
-                        break;
-                    case Constants.EVENT_TYPE_FEEDBACK:
-                        emitter.emit(Constants.EVENT_FEEDBACK, frame, body);
-                        break;
-                    case Constants.EVENT_TYPE_DISCONNECTED:
-                        // 被服务端踢下线：先触发事件，再关闭连接
-                        log.warn("收到服务端断开通知 (disconnected_event)");
-                        closedByServer = true;
-                        emitter.emit(Constants.EVENT_DISCONNECTED, frame, body);
-                        closeConn();
-                        break;
-                    default:
-                        break;
+            if(Constants.CMD_RESPOND_MSG.equals(cmd)||Constants.CMD_RESPOND_UPDATE_MSG.equals(cmd)||Constants.CMD_RESPOND_WELCOME_MSG.equals(cmd)
+                    ||Constants.CMD_SUBSCRIBE.equals(cmd)||Constants.CMD_PING.equals(cmd))ProtocolValidator.invalid("该命令由连接管理或回调回复入口处理");
+            JsonNode json=mapper.valueToTree(body); ProtocolValidator.body(cmd,json);
+            String target=Constants.CMD_SEND_MSG.equals(cmd)?target(json):null;
+            return connection.request(cmd,generateReqId(cmd),json,target,connection.generation(),Long.MAX_VALUE);
+        } catch(Exception e){return SdkFutures.failed(e);}
+    }
+    @Deprecated
+    public Frame send(String cmd,Object body) throws IOException,TimeoutException,InterruptedException {return SdkFutures.await(sendAsync(cmd,body));}
+    public CompletionStage<Frame> replyAsync(Frame callback,ReplyBody body) {return replyCommand(callback,body,Constants.CMD_RESPOND_MSG);}
+    private CompletionStage<Frame> replyCommand(Frame callback,Object body,String cmd) {
+        try {
+            if(callback==null || callback.getHeaders()==null || callback.getBody()==null || !connection.clientId().equals(callback.getClientId()))ProtocolValidator.invalid("必须使用当前客户端收到的原始回调帧");
+            String reqId=callback.getHeaders().getReqId();
+            ProtocolValidator.text(mapper.valueToTree(reqId),256,true,"req_id");
+            JsonNode json=mapper.valueToTree(body); ProtocolValidator.body(cmd,json);
+            String event=callback.getBody().path("event").path("eventtype").asText();
+            long window;
+            if(Constants.CMD_RESPOND_MSG.equals(cmd)) {
+                if(!Constants.CMD_MSG_CALLBACK.equals(callback.getCmd()))ProtocolValidator.invalid("普通回复只能用于消息回调");
+                window=TimeUnit.HOURS.toNanos(24);
+            } else {
+                String required=Constants.CMD_RESPOND_WELCOME_MSG.equals(cmd)?Constants.EVENT_TYPE_ENTER_CHAT:Constants.EVENT_TYPE_TEMPLATE_CARD;
+                if(!Constants.CMD_EVENT_CALLBACK.equals(callback.getCmd()) || !required.equals(event))ProtocolValidator.invalid("命令与事件类型不匹配");
+                if(Constants.CMD_RESPOND_UPDATE_MSG.equals(cmd)) {
+                    JsonNode eventBody=callback.getBody().path("event");
+                    String task=eventBody.path("template_card_event").path("task_id").asText(eventBody.path("task_id").asText());
+                    if(task.isEmpty() || !task.equals(json.path("template_card").path("task_id").asText()))ProtocolValidator.invalid("更新卡片 task_id 必须与点击事件一致");
                 }
+                window=TimeUnit.SECONDS.toNanos(5);
             }
-        } catch (Exception e) {
-            log.warn("事件回调解析失败: {}", e.getMessage());
-        }
+            return connection.request(cmd,reqId,json,callbackTarget(callback.getBody()),callback.getGeneration(),callback.getReceivedNanos()+window);
+        } catch(Exception e){return SdkFutures.failed(e);}
     }
-
-    // =========================================================================
-    // 发送与回复
-    // =========================================================================
-
-    /**
-     * 发送一个帧并等待服务端响应（通过 req_id 匹配）。
-     *
-     * @param cmd  命令类型
-     * @param body 消息体对象
-     * @return 服务端响应帧
-     * @throws IOException          连接已关闭或写入失败
-     * @throws TimeoutException     等待响应超时
-     * @throws InterruptedException 等待过程中被中断
-     */
-    public Frame send(String cmd, Object body) throws IOException, TimeoutException, InterruptedException {
-        String reqId = generateReqId(cmd);
-
-        JsonNode bodyNode = null;
-        if (body != null) {
-            bodyNode = objectMapper.valueToTree(body);
-        }
-
-        Frame frame = new Frame(cmd, new Headers(reqId), bodyNode);
-        String json;
-        try {
-            json = objectMapper.writeValueAsString(frame);
-        } catch (JsonProcessingException e) {
-            throw new IOException("序列化帧失败: " + e.getMessage(), e);
-        }
-
-        CompletableFuture<Frame> future = new CompletableFuture<>();
-        pending.put(reqId, future);
-
-        // 加锁检查 + 写入，原子操作避免 TOCTOU 竞态
-        synchronized (writeLock) {
-            WebSocket ws = webSocket;
-            if (ws == null || !connected.get()) {
-                pending.remove(reqId);
-                throw new IOException("连接已关闭");
-            }
-            boolean sent = ws.send(json);
-            if (!sent) {
-                pending.remove(reqId);
-                throw new IOException("写入失败：WebSocket 发送队列已满");
-            }
-        }
-
-        try {
-            return future.get(options.getRequestTimeoutMs(), TimeUnit.MILLISECONDS);
-        } catch (TimeoutException e) {
-            pending.remove(reqId);
-            throw new TimeoutException("等待 " + reqId + " 的响应超时");
-        } catch (ExecutionException e) {
-            pending.remove(reqId);
-            throw new IOException("等待响应失败: " + e.getCause().getMessage(), e.getCause());
-        } catch (InterruptedException e) {
-            pending.remove(reqId);
-            Thread.currentThread().interrupt(); // 保留中断标记
-            throw e;
-        }
+    private static String callbackTarget(JsonNode body) throws AiBotException {
+        boolean group="group".equals(body.path("chattype").asText());
+        String id=group?body.path("chatid").asText():body.path("from").path("userid").asText();
+        if(id.isEmpty())ProtocolValidator.invalid("回调缺少会话目标");
+        return id;
     }
-
-    /**
-     * 使用回调帧的 req_id 发送回复（不等待响应）。
-     */
-    private void sendReply(String cmd, String reqId, Object body) throws IOException {
-        JsonNode bodyNode = objectMapper.valueToTree(body);
-        Frame frame = new Frame(cmd, new Headers(reqId), bodyNode);
-        String json;
-        try {
-            json = objectMapper.writeValueAsString(frame);
-        } catch (JsonProcessingException e) {
-            throw new IOException("序列化帧失败: " + e.getMessage(), e);
-        }
-
-        // 加锁检查 + 写入，原子操作
-        synchronized (writeLock) {
-            WebSocket ws = webSocket;
-            if (ws == null || !connected.get()) {
-                throw new IOException("连接已关闭");
-            }
-            ws.send(json);
-        }
+    private static String target(JsonNode body) {
+        // 相同 id 共用额度，避免通过切换 chat_type 绕过本地限流。
+        return body.path("chatid").asText();
     }
-
-    /**
-     * 向回调帧发送通用回复。
-     */
-    public void reply(Frame callbackFrame, ReplyBody body) throws IOException {
-        sendReply(Constants.CMD_RESPOND_MSG, callbackFrame.getHeaders().getReqId(), body);
+    @Deprecated
+    public void reply(Frame callback,ReplyBody body) throws IOException {SdkFutures.awaitIo(replyAsync(callback,body));}
+    /** 一次性纯文本通过 finish=true 的 stream 发送。 */
+    public CompletionStage<Frame> replyTextAsync(Frame callback,String content) {return replyStreamAsync(callback,generateReqId("stream"),content,true);}
+    @Deprecated
+    public void replyText(Frame callback,String content) throws IOException {SdkFutures.awaitIo(replyTextAsync(callback,content));}
+    public CompletionStage<Frame> replyMarkdownAsync(Frame callback,String content) {
+        ReplyBody body=new ReplyBody();body.setMsgType("markdown");body.setMarkdown(new MarkdownContent(content));return replyAsync(callback,body);
     }
-
-    /**
-     * 回复纯文本消息。
-     */
-    public void replyText(Frame callbackFrame, String content) throws IOException {
-        ReplyBody body = new ReplyBody();
-        body.setMsgType(Constants.MSG_TYPE_TEXT);
-        body.setText(new TextContent(content));
-        reply(callbackFrame, body);
+    @Deprecated
+    public void replyMarkdown(Frame callback,String content) throws IOException {SdkFutures.awaitIo(replyMarkdownAsync(callback,content));}
+    public CompletionStage<Frame> replyStreamAsync(Frame callback,String id,String content,boolean finish) {return replyStreamAsync(callback,id,content,finish,null);}
+    public CompletionStage<Frame> replyStreamAsync(Frame callback,String id,String content,boolean finish,ReplyFeedback feedback) {
+        ReplyBody body=new ReplyBody();body.setMsgType("stream");StreamContent stream=new StreamContent(id,finish,content);stream.setFeedback(feedback);body.setStream(stream);return replyAsync(callback,body);
     }
-
-    /**
-     * 回复 Markdown 格式消息。
-     */
-    public void replyMarkdown(Frame callbackFrame, String content) throws IOException {
-        ReplyBody body = new ReplyBody();
-        body.setMsgType(Constants.MSG_TYPE_MARKDOWN);
-        body.setMarkdown(new MarkdownContent(content));
-        reply(callbackFrame, body);
+    @Deprecated
+    public void replyStream(Frame callback,String id,String content,boolean finish) throws IOException {SdkFutures.awaitIo(replyStreamAsync(callback,id,content,finish));}
+    public CompletionStage<Frame> replyTemplateCardAsync(Frame callback,TemplateCard card) {ReplyBody body=new ReplyBody();body.setMsgType("template_card");body.setTemplateCard(card);return replyAsync(callback,body);}
+    @Deprecated
+    public void replyTemplateCard(Frame callback,TemplateCard card) throws IOException {SdkFutures.awaitIo(replyTemplateCardAsync(callback,card));}
+    public CompletionStage<Frame> replyWelcomeAsync(Frame callback,ReplyBody body) {return replyCommand(callback,body,Constants.CMD_RESPOND_WELCOME_MSG);}
+    @Deprecated
+    public void replyWelcome(Frame callback,ReplyBody body) throws IOException {SdkFutures.awaitIo(replyWelcomeAsync(callback,body));}
+    public CompletionStage<Frame> updateTemplateCardAsync(Frame callback,TemplateCard card,List<String> userIds) {
+        UpdateCardBody body=new UpdateCardBody("update_template_card",card);body.setUserIds(userIds);return replyCommand(callback,body,Constants.CMD_RESPOND_UPDATE_MSG);
     }
-
-    /**
-     * 发送或更新流式消息。设置 finish=true 结束流式输出。
-     */
-    public void replyStream(Frame callbackFrame, String streamId, String content, boolean finish) throws IOException {
-        ReplyBody body = new ReplyBody();
-        body.setMsgType(Constants.MSG_TYPE_STREAM);
-        body.setStream(new StreamContent(streamId, finish, content));
-        reply(callbackFrame, body);
+    public CompletionStage<Frame> updateTemplateCardAsync(Frame callback,TemplateCard card) {return updateTemplateCardAsync(callback,card,null);}
+    @Deprecated
+    public void updateTemplateCard(Frame callback,TemplateCard card) throws IOException {SdkFutures.awaitIo(updateTemplateCardAsync(callback,card));}
+    @Deprecated
+    public void updateTemplateCard(Frame callback,TemplateCard card,List<String> userIds) throws IOException {SdkFutures.awaitIo(updateTemplateCardAsync(callback,card,userIds));}
+    public CompletionStage<Frame> sendMessageAsync(SendMsgBody body) {return sendAsync(Constants.CMD_SEND_MSG,body);}
+    @Deprecated
+    public void sendMessage(SendMsgBody body) throws IOException,TimeoutException,InterruptedException {SdkFutures.await(sendMessageAsync(body));}
+    public CompletionStage<Frame> sendMarkdownAsync(String chatId,int chatType,String content) {
+        SendMsgBody body=new SendMsgBody();body.setChatId(chatId);body.setChatType(chatType);body.setMsgType("markdown");body.setMarkdown(new MarkdownContent(content));return sendMessageAsync(body);
     }
-
-    /**
-     * 回复模板卡片消息。
-     */
-    public void replyTemplateCard(Frame callbackFrame, TemplateCard card) throws IOException {
-        ReplyBody body = new ReplyBody();
-        body.setMsgType(Constants.MSG_TYPE_CARD);
-        body.setTemplateCard(card);
-        reply(callbackFrame, body);
+    @Deprecated
+    public void sendMarkdown(String chatId,int chatType,String content) throws IOException,TimeoutException,InterruptedException {SdkFutures.await(sendMarkdownAsync(chatId,chatType,content));}
+    public CompletionStage<Frame> replyMediaAsync(Frame callback,String type,String mediaId) {return replyMediaAsync(callback,type,mediaId,null,null);}
+    public CompletionStage<Frame> replyMediaAsync(Frame callback,String type,String mediaId,String title,String description) {
+        if(type==null)return SdkFutures.failed(new AiBotException(AiBotException.Code.INVALID_ARGUMENT,"媒体类型为空"));
+        ReplyBody body=new ReplyBody();body.setMsgType(type);MediaContent value=new MediaContent(mediaId);value.setTitle(title);value.setDescription(description);
+        switch(type){case "image":body.setImage(value);break;case "file":body.setFile(value);break;case "voice":body.setVoice(value);break;case "video":body.setVideo(value);break;default:return SdkFutures.failed(new AiBotException(AiBotException.Code.INVALID_ARGUMENT,"媒体类型无效"));}
+        return replyAsync(callback,body);
     }
-
-    /**
-     * 发送欢迎语（需在收到 enter_chat 事件后 5 秒内调用）。
-     */
-    public void replyWelcome(Frame callbackFrame, ReplyBody body) throws IOException {
-        sendReply(Constants.CMD_RESPOND_WELCOME_MSG, callbackFrame.getHeaders().getReqId(), body);
+    @Deprecated
+    public void replyMedia(Frame callback,String type,String mediaId) throws IOException {SdkFutures.awaitIo(replyMediaAsync(callback,type,mediaId));}
+    public CompletionStage<Frame> sendMediaMessageAsync(String chatId,int chatType,String type,String mediaId) {return sendMediaMessageAsync(chatId,chatType,type,mediaId,null,null);}
+    public CompletionStage<Frame> sendMediaMessageAsync(String chatId,int chatType,String type,String mediaId,String title,String description) {
+        if(type==null)return SdkFutures.failed(new AiBotException(AiBotException.Code.INVALID_ARGUMENT,"媒体类型为空"));
+        SendMsgBody body=new SendMsgBody();body.setChatId(chatId);body.setChatType(chatType);body.setMsgType(type);MediaContent value=new MediaContent(mediaId);value.setTitle(title);value.setDescription(description);
+        switch(type){case "image":body.setImage(value);break;case "file":body.setFile(value);break;case "voice":body.setVoice(value);break;case "video":body.setVideo(value);break;default:return SdkFutures.failed(new AiBotException(AiBotException.Code.INVALID_ARGUMENT,"媒体类型无效"));}
+        return sendMessageAsync(body);
     }
-
-    /**
-     * 更新已有的模板卡片（需在收到卡片点击事件后 5 秒内调用）。
-     */
-    public void updateTemplateCard(Frame callbackFrame, TemplateCard card) throws IOException {
-        UpdateCardBody updateBody = new UpdateCardBody("update_template_card", card);
-        sendReply(Constants.CMD_RESPOND_UPDATE_MSG, callbackFrame.getHeaders().getReqId(), updateBody);
-    }
-
-    /**
-     * 主动向会话推送消息。
-     */
-    public void sendMessage(SendMsgBody body) throws IOException, TimeoutException, InterruptedException {
-        Frame resp = send(Constants.CMD_SEND_MSG, body);
-        if (resp.getErrCode() != 0) {
-            throw new IOException("发送消息失败: " + resp.getErrCode() + " " + resp.getErrMsg());
-        }
-    }
-
-    /**
-     * 主动推送 Markdown 消息。
-     */
-    public void sendMarkdown(String chatId, int chatType, String content) throws IOException, TimeoutException, InterruptedException {
-        SendMsgBody body = new SendMsgBody();
-        body.setChatId(chatId);
-        body.setChatType(chatType);
-        body.setMsgType(Constants.MSG_TYPE_MARKDOWN);
-        body.setMarkdown(new MarkdownContent(content));
-        sendMessage(body);
-    }
-
-    // =========================================================================
-    // 流式消息会话工厂
-    // =========================================================================
-
-    /**
-     * 创建一个新的流式消息会话。
-     */
-    public StreamSession newStream(Frame callbackFrame) {
-        return new StreamSession(this, callbackFrame, generateReqId("stream"), log);
-    }
-
-    /**
-     * 创建一个使用指定 streamID 的流式消息会话。
-     */
-    public StreamSession newStreamWithId(Frame callbackFrame, String streamId) {
-        return new StreamSession(this, callbackFrame, streamId, log);
-    }
-
-    // =========================================================================
-    // 连接关闭
-    // =========================================================================
-
-    /**
-     * 安全关闭当前连接并通知读循环退出。
-     * 可被多个线程安全调用（幂等）。
-     */
-    private void closeConn() {
-        connected.set(false);
-        synchronized (writeLock) {
-            WebSocket ws = webSocket;
-            if (ws != null) {
-                try {
-                    ws.close(1000, "客户端关闭");
-                } catch (Exception ignored) {
-                    // 忽略关闭过程中的异常
-                }
-                webSocket = null;
-            }
-        }
-        cleanupPending();
-    }
-
-    /**
-     * 清理所有待处理的请求，避免线程泄漏。
-     */
-    private void cleanupPending() {
-        for (Map.Entry<String, CompletableFuture<Frame>> entry : pending.entrySet()) {
-            Frame errFrame = new Frame();
-            errFrame.setErrCode(-1);
-            errFrame.setErrMsg("连接已关闭");
-            entry.getValue().complete(errFrame);
-        }
-        pending.clear();
-    }
-
-    /**
-     * 优雅地关闭 WebSocket 连接并停止客户端。
-     */
-    public void disconnect() {
-        running = false;
-        closeConn();
-        stopHeartbeat();
-        dispatchExecutor.shutdownNow();
-        httpClient.dispatcher().executorService().shutdown();
-        httpClient.connectionPool().evictAll();
-    }
-
-    /**
-     * 计算指数退避延迟（带上限）。
-     */
-    private long backoff(int attempt) {
-        long delay = (long) (options.getReconnectBaseDelayMs() * Math.pow(2, attempt - 1));
-        return Math.min(delay, options.getReconnectMaxDelayMs());
-    }
-
-    /**
-     * 获取内部 ObjectMapper（供 MediaUtils 使用）。
-     */
-    ObjectMapper getObjectMapper() {
-        return objectMapper;
-    }
+    @Deprecated
+    public void sendMediaMessage(String chatId,int chatType,String type,String mediaId) throws IOException,TimeoutException,InterruptedException {SdkFutures.await(sendMediaMessageAsync(chatId,chatType,type,mediaId));}
+    public CompletionStage<UploadedMedia> uploadMediaAsync(String type,String filename,byte[] data) {return media.upload(type,filename,data);}
+    public CompletionStage<UploadedMedia> uploadMediaAsync(String type,Path path) {return media.upload(type,path);}
+    public CompletionStage<MediaUtils.DownloadResult> downloadFileAsync(String url,String aesKey) {return media.download(url,aesKey);}
+    public StreamSession newStream(Frame callback) {return newStreamWithId(callback,generateReqId("stream"));}
+    public StreamSession newStreamWithId(Frame callback,String id) {return new StreamSession(this,callback,id,log);}
+    ObjectMapper getObjectMapper() {return mapper;}
+    void awaitReady(long deadline) throws IOException,InterruptedException {connection.awaitReady(deadline);}
+    Options options() {return options;}
+    /** 幂等终态关闭；取消媒体任务及连接，不隐式重放已发消息。 */
+    @Override public void close() {connection.close();media.close();}
+    public void disconnect() {close();}
 }

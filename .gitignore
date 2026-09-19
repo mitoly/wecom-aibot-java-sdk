@@ -31,3 +31,6 @@ secret.txt
 # 日志
 *.log
 logs/
+
+# 示例机器人下载的媒体文件
+downloads/

@@ -4,14 +4,12 @@ import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
 
-import java.util.List;
-
 /**
  * 图文混排消息的单个元素。
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 @JsonInclude(JsonInclude.Include.NON_NULL)
-public class MixedItem {
+public class MixedItem extends ProtocolModel {
 
     @JsonProperty("msgtype")
     private String msgType;

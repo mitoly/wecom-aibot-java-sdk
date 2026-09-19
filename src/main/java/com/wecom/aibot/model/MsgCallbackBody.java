@@ -9,7 +9,7 @@ import com.fasterxml.jackson.annotation.JsonProperty;
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 @JsonInclude(JsonInclude.Include.NON_NULL)
-public class MsgCallbackBody {
+public class MsgCallbackBody extends ProtocolModel {
 
     @JsonProperty("msgid")
     private String msgId;
@@ -145,4 +145,13 @@ public class MsgCallbackBody {
     public void setVideo(MediaContent video) {
         this.video = video;
     }
+    @JsonProperty("quote") private QuoteContent quote;
+    public QuoteContent getQuote() { return quote; }
+    public void setQuote(QuoteContent value) { this.quote = value; }
+    @JsonProperty("create_time") private Long createTime;
+    public Long getCreateTime() { return createTime; }
+    public void setCreateTime(Long value) { this.createTime = value; }
+    @JsonProperty("response_url") private String responseUrl;
+    public String getResponseUrl() { return responseUrl; }
+    public void setResponseUrl(String value) { this.responseUrl = value; }
 }

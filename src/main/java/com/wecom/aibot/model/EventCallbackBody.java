@@ -9,7 +9,7 @@ import com.fasterxml.jackson.annotation.JsonProperty;
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 @JsonInclude(JsonInclude.Include.NON_NULL)
-public class EventCallbackBody {
+public class EventCallbackBody extends ProtocolModel {
 
     @JsonProperty("msgid")
     private String msgId;
@@ -90,4 +90,10 @@ public class EventCallbackBody {
     public void setEvent(EventInfo event) {
         this.event = event;
     }
+    @JsonProperty("chattype") private String chatType;
+    public String getChatType() { return chatType; }
+    public void setChatType(String value) { this.chatType = value; }
+    @JsonProperty("response_url") private String responseUrl;
+    public String getResponseUrl() { return responseUrl; }
+    public void setResponseUrl(String value) { this.responseUrl = value; }
 }

@@ -1,0 +1,1 @@
+{"cmd":"aibot_event_callback","headers":{"req_id":"feedback-1"},"body":{"msgid":"event-2","create_time":1700000000,"aibotid":"bot-1","chattype":"single","from":{"userid":"user-1"},"msgtype":"event","event":{"eventtype":"feedback_event","feedback_event":{"id":"feedback-id","type":2,"content":"more detail","inaccurate_reason_list":[2,4]}}}}

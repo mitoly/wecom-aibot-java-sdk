@@ -1,0 +1,23 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <parent><groupId>com.delixi.agent</groupId><artifactId>agent-platform</artifactId><version>0.1.0-SNAPSHOT</version><relativePath>../../../../agent-platform/pom.xml</relativePath></parent>
+  <artifactId>wecom-sdk-consumer-smoke</artifactId>
+  <dependencyManagement><dependencies>
+    <!-- AgentScope OpenAI 使用 okhttp-jvm 5；避免 SDK 的 okhttp 4 同时提供重复类。 -->
+    <dependency><groupId>com.squareup.okhttp3</groupId><artifactId>okhttp</artifactId><version>5.3.2</version></dependency>
+    <dependency><groupId>com.squareup.okhttp3</groupId><artifactId>okhttp-jvm</artifactId><version>5.3.2</version></dependency>
+  </dependencies></dependencyManagement>
+  <dependencies>
+    <dependency><groupId>com.wecom</groupId><artifactId>wecom-aibot-java-sdk</artifactId><version>1.1.0-SNAPSHOT</version></dependency>
+    <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-webflux</artifactId></dependency>
+    <dependency><groupId>io.agentscope</groupId><artifactId>agentscope-harness</artifactId><version>2.0.1</version></dependency>
+    <dependency><groupId>io.agentscope</groupId><artifactId>agentscope-extensions-agui</artifactId><version>2.0.1</version></dependency>
+    <dependency><groupId>io.agentscope</groupId><artifactId>agentscope-extensions-model-openai</artifactId><version>2.0.1</version></dependency>
+    <dependency><groupId>com.squareup.okhttp3</groupId><artifactId>mockwebserver</artifactId><version>5.3.2</version><scope>test</scope></dependency>
+    <dependency><groupId>junit</groupId><artifactId>junit</artifactId><version>4.13.2</version><scope>test</scope></dependency>
+  </dependencies>
+  <build><plugins>
+    <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-compiler-plugin</artifactId><version>3.13.0</version><configuration><release>21</release></configuration></plugin>
+    <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-surefire-plugin</artifactId><version>3.5.2</version></plugin>
+  </plugins></build>
+</project>

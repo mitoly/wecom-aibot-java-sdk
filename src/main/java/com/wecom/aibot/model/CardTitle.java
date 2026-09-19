@@ -9,7 +9,7 @@ import com.fasterxml.jackson.annotation.JsonProperty;
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 @JsonInclude(JsonInclude.Include.NON_NULL)
-public class CardTitle {
+public class CardTitle extends ProtocolModel {
 
     @JsonProperty("title")
     private String title;

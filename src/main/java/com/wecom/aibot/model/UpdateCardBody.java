@@ -9,7 +9,7 @@ import com.fasterxml.jackson.annotation.JsonProperty;
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 @JsonInclude(JsonInclude.Include.NON_NULL)
-public class UpdateCardBody {
+public class UpdateCardBody extends ProtocolModel {
 
     @JsonProperty("response_type")
     private String responseType;
@@ -40,4 +40,7 @@ public class UpdateCardBody {
     public void setTemplateCard(TemplateCard templateCard) {
         this.templateCard = templateCard;
     }
+    @JsonProperty("userids") private java.util.List<String> userIds;
+    public java.util.List<String> getUserIds() { return userIds; }
+    public void setUserIds(java.util.List<String> value) { this.userIds = value; }
 }

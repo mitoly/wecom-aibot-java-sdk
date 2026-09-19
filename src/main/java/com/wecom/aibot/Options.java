@@ -35,6 +35,18 @@ public class Options {
     // 单帧写入超时
     private long requestTimeoutMs = Constants.DEFAULT_REQUEST_TIMEOUT_MS;
 
+    private long connectTimeoutMs = 10000L;
+    private long replyAckTimeoutMs = 5000L;
+    private int maxAuthFailureAttempts = 5;
+    private int maxMissedHeartbeats = 3;
+    private int maxReplyQueueSize = 32;
+    private int maxPendingRequests = 1024;
+    private int callbackThreads = 4;
+    private int callbackQueueSize = 256;
+    private long maxDownloadBytes = 20 * 1024 * 1024L + 32;
+    private int uploadChunkConcurrency = 2;
+    private int maxChunkRetries = 2;
+
     /**
      * 校验并加载凭证。如果配置了文件路径则从文件读取。
      *
@@ -51,11 +63,21 @@ public class Options {
             secret = new String(data, StandardCharsets.UTF_8).trim();
         }
 
-        if (botId == null || botId.isEmpty()) {
+        if (botId == null || botId.trim().isEmpty()) {
             throw new IllegalArgumentException("BotID 不能为空（请设置 botId 或 botIdFile）");
         }
-        if (secret == null || secret.isEmpty()) {
+        if (secret == null || secret.trim().isEmpty()) {
             throw new IllegalArgumentException("Secret 不能为空（请设置 secret 或 secretFile）");
+        }
+        if (wsUrl == null || !(wsUrl.startsWith("wss://") || wsUrl.startsWith("ws://"))) {
+            throw new IllegalArgumentException("wsUrl 必须使用 ws 或 wss");
+        }
+        if (heartbeatIntervalMs <= 0 || requestTimeoutMs <= 0 || connectTimeoutMs <= 0 || replyAckTimeoutMs <= 0
+                || reconnectBaseDelayMs <= 0 || reconnectMaxDelayMs < reconnectBaseDelayMs
+                || maxReconnectAttempts < -1 || maxAuthFailureAttempts < -1 || maxMissedHeartbeats <= 0
+                || maxReplyQueueSize <= 0 || maxPendingRequests <= 0 || callbackThreads <= 0 || callbackQueueSize <= 0
+                || maxDownloadBytes <= 0 || uploadChunkConcurrency <= 0 || uploadChunkConcurrency > 4 || maxChunkRetries < 0) {
+            throw new IllegalArgumentException("时间、容量或重试参数无效");
         }
     }
 
@@ -162,5 +184,54 @@ public class Options {
     public Options setRequestTimeoutMs(long requestTimeoutMs) {
         this.requestTimeoutMs = requestTimeoutMs;
         return this;
+    }
+    public long getConnectTimeoutMs() { return connectTimeoutMs; }
+    public Options setConnectTimeoutMs(long value) { this.connectTimeoutMs = value; return this; }
+    public long getReplyAckTimeoutMs() { return replyAckTimeoutMs; }
+    public Options setReplyAckTimeoutMs(long value) { this.replyAckTimeoutMs = value; return this; }
+    public int getMaxAuthFailureAttempts() { return maxAuthFailureAttempts; }
+    public Options setMaxAuthFailureAttempts(int value) { this.maxAuthFailureAttempts = value; return this; }
+    public int getMaxMissedHeartbeats() { return maxMissedHeartbeats; }
+    public Options setMaxMissedHeartbeats(int value) { this.maxMissedHeartbeats = value; return this; }
+    public int getMaxReplyQueueSize() { return maxReplyQueueSize; }
+    public Options setMaxReplyQueueSize(int value) { this.maxReplyQueueSize = value; return this; }
+    public int getMaxPendingRequests() { return maxPendingRequests; }
+    public Options setMaxPendingRequests(int value) { this.maxPendingRequests = value; return this; }
+    public int getCallbackThreads() { return callbackThreads; }
+    public Options setCallbackThreads(int value) { this.callbackThreads = value; return this; }
+    public int getCallbackQueueSize() { return callbackQueueSize; }
+    public Options setCallbackQueueSize(int value) { this.callbackQueueSize = value; return this; }
+    public long getMaxDownloadBytes() { return maxDownloadBytes; }
+    public Options setMaxDownloadBytes(long value) { this.maxDownloadBytes = value; return this; }
+    public int getUploadChunkConcurrency() { return uploadChunkConcurrency; }
+    public Options setUploadChunkConcurrency(int value) { this.uploadChunkConcurrency = value; return this; }
+    public int getMaxChunkRetries() { return maxChunkRetries; }
+    public Options setMaxChunkRetries(int value) { this.maxChunkRetries = value; return this; }
+
+    Options snapshot() throws IOException {
+        Options copy = new Options();
+        copy.botId = this.botId;
+        copy.secret = this.secret;
+        copy.botIdFile = this.botIdFile;
+        copy.secretFile = this.secretFile;
+        copy.wsUrl = this.wsUrl;
+        copy.heartbeatIntervalMs = this.heartbeatIntervalMs;
+        copy.requestTimeoutMs = this.requestTimeoutMs;
+        copy.reconnectBaseDelayMs = this.reconnectBaseDelayMs;
+        copy.reconnectMaxDelayMs = this.reconnectMaxDelayMs;
+        copy.maxReconnectAttempts = this.maxReconnectAttempts;
+        copy.connectTimeoutMs = this.connectTimeoutMs;
+        copy.replyAckTimeoutMs = this.replyAckTimeoutMs;
+        copy.maxAuthFailureAttempts = this.maxAuthFailureAttempts;
+        copy.maxMissedHeartbeats = this.maxMissedHeartbeats;
+        copy.maxReplyQueueSize = this.maxReplyQueueSize;
+        copy.maxPendingRequests = this.maxPendingRequests;
+        copy.callbackThreads = this.callbackThreads;
+        copy.callbackQueueSize = this.callbackQueueSize;
+        copy.maxDownloadBytes = this.maxDownloadBytes;
+        copy.uploadChunkConcurrency = this.uploadChunkConcurrency;
+        copy.maxChunkRetries = this.maxChunkRetries;
+        copy.validate();
+        return copy;
     }
 }

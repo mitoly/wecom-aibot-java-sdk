@@ -9,7 +9,7 @@ import com.fasterxml.jackson.annotation.JsonProperty;
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 @JsonInclude(JsonInclude.Include.NON_NULL)
-public class CardKV {
+public class CardKV extends ProtocolModel {
 
     @JsonProperty("keyname")
     private String keyName;
@@ -40,4 +40,13 @@ public class CardKV {
     public void setValue(String value) {
         this.value = value;
     }
+    @JsonProperty("type") private Integer type;
+    public Integer getType() { return type; }
+    public void setType(Integer value) { this.type = value; }
+    @JsonProperty("url") private String url;
+    public String getUrl() { return url; }
+    public void setUrl(String value) { this.url = value; }
+    @JsonProperty("userid") private String userId;
+    public String getUserId() { return userId; }
+    public void setUserId(String value) { this.userId = value; }
 }

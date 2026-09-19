@@ -9,7 +9,7 @@ import com.fasterxml.jackson.annotation.JsonProperty;
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 @JsonInclude(JsonInclude.Include.NON_NULL)
-public class MediaContent {
+public class MediaContent extends ProtocolModel {
 
     @JsonProperty("url")
     private String url;
@@ -50,4 +50,10 @@ public class MediaContent {
     public void setMediaId(String mediaId) {
         this.mediaId = mediaId;
     }
+    @JsonProperty("title") private String title;
+    public String getTitle() { return title; }
+    public void setTitle(String value) { this.title = value; }
+    @JsonProperty("description") private String description;
+    public String getDescription() { return description; }
+    public void setDescription(String value) { this.description = value; }
 }
