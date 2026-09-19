@@ -32,14 +32,16 @@ public class WeComAiBotClient implements AutoCloseable {
         this.log=logger==null?new AiBotLogger.Slf4jLogger():logger;
         callbacks=new ThreadPoolExecutor(this.options.getCallbackThreads(),this.options.getCallbackThreads(),0,TimeUnit.MILLISECONDS,
                 new ArrayBlockingQueue<>(this.options.getCallbackQueueSize()),ConnectionManager.threadFactory("wecom-callback"),new ThreadPoolExecutor.AbortPolicy());
-        emitter.setErrorCallback((event,error) -> log.error("事件处理失败: {}",event));
+        emitter.setErrorCallback((event,error) -> log.error("事件处理失败: {}",event,error));
         OkHttpClient http=new OkHttpClient.Builder().connectTimeout(this.options.getConnectTimeoutMs(),TimeUnit.MILLISECONDS).pingInterval(0,TimeUnit.SECONDS).build();
-        connection=new ConnectionManager(this.options,mapper,http,this::emit,this::dispatch);
+        connection=new ConnectionManager(this.options,mapper,http,this::emit,this::dispatch,http::newWebSocket,System::nanoTime,log);
         media=new MediaTransfer(this,this.options);
         connection.termination().whenComplete((value,error) -> callbacks.shutdown());
     }
     /** 注册事件；返回值可幂等注销。请把耗时业务安排到调用方自己的执行器。 */
     public EventEmitter.Disposable on(String event,EventEmitter.Handler handler) {return emitter.on(event,handler);}
+    /** 接管 handler 异常回调（默认仅记日志）；参数为 (事件名, 异常)，回调内请勿抛出。 */
+    public void setEventErrorHandler(java.util.function.BiConsumer<String,Exception> callback) {emitter.setErrorCallback(callback);}
     /** 物理连接已经打开；业务发送应检查 getState()==READY。 */
     public boolean isConnected() {return getState()==BotConnectionState.AUTHENTICATING || getState()==BotConnectionState.READY;}
     public long getRejectedCallbackCount() {return rejectedCallbacks.get();}
@@ -71,7 +73,7 @@ public class WeComAiBotClient implements AutoCloseable {
                     emitter.emit(Constants.EVENT_EVENT,frame,body);
                     if(body.getEvent()!=null)emitter.emit("event."+body.getEvent().getEventType(),frame,body);
                 }
-            } catch(Exception e){emitter.emit(Constants.EVENT_ERROR,frame,new AiBotException(AiBotException.Code.PROTOCOL_ERROR,"回调解析失败"));}
+            } catch(Exception e){emitter.emit(Constants.EVENT_ERROR,frame,new AiBotException(AiBotException.Code.PROTOCOL_ERROR,"回调解析失败",e));}
         });
     }
     /** 高级发送入口；回调回复请使用 replyAsync，以便透传 req_id 与检查上下文。 */
@@ -81,7 +83,8 @@ public class WeComAiBotClient implements AutoCloseable {
                     ||Constants.CMD_SUBSCRIBE.equals(cmd)||Constants.CMD_PING.equals(cmd))ProtocolValidator.invalid("该命令由连接管理或回调回复入口处理");
             JsonNode json=mapper.valueToTree(body); ProtocolValidator.body(cmd,json);
             String target=Constants.CMD_SEND_MSG.equals(cmd)?target(json):null;
-            return connection.request(cmd,generateReqId(cmd),json,target,connection.generation(),Long.MAX_VALUE);
+            // 主动推送使用新生成 req_id，不绑定回调连接代；-1 跳过代校验，重连瞬间不受 STALE_CONTEXT 误杀。
+            return connection.request(cmd,generateReqId(cmd),json,target,-1,Long.MAX_VALUE);
         } catch(Exception e){return SdkFutures.failed(e);}
     }
     @Deprecated

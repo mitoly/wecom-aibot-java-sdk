@@ -44,6 +44,9 @@ public class Options {
     private int callbackThreads = 4;
     private int callbackQueueSize = 256;
     private long maxDownloadBytes = 20 * 1024 * 1024L + 32;
+    // 下载独立超时：弱网大文件读取远慢于控制帧，不复用 requestTimeoutMs（对齐旧版 30s/60s）
+    private long downloadConnectTimeoutMs = 30000L;
+    private long downloadReadTimeoutMs = 60000L;
     private int uploadChunkConcurrency = 2;
     private int maxChunkRetries = 2;
 
@@ -76,7 +79,8 @@ public class Options {
                 || reconnectBaseDelayMs <= 0 || reconnectMaxDelayMs < reconnectBaseDelayMs
                 || maxReconnectAttempts < -1 || maxAuthFailureAttempts < -1 || maxMissedHeartbeats <= 0
                 || maxReplyQueueSize <= 0 || maxPendingRequests <= 0 || callbackThreads <= 0 || callbackQueueSize <= 0
-                || maxDownloadBytes <= 0 || uploadChunkConcurrency <= 0 || uploadChunkConcurrency > 4 || maxChunkRetries < 0) {
+                || maxDownloadBytes <= 0 || downloadConnectTimeoutMs <= 0 || downloadReadTimeoutMs <= 0
+                || uploadChunkConcurrency <= 0 || uploadChunkConcurrency > 4 || maxChunkRetries < 0) {
             throw new IllegalArgumentException("时间、容量或重试参数无效");
         }
     }
@@ -203,6 +207,10 @@ public class Options {
     public Options setCallbackQueueSize(int value) { this.callbackQueueSize = value; return this; }
     public long getMaxDownloadBytes() { return maxDownloadBytes; }
     public Options setMaxDownloadBytes(long value) { this.maxDownloadBytes = value; return this; }
+    public long getDownloadConnectTimeoutMs() { return downloadConnectTimeoutMs; }
+    public Options setDownloadConnectTimeoutMs(long value) { this.downloadConnectTimeoutMs = value; return this; }
+    public long getDownloadReadTimeoutMs() { return downloadReadTimeoutMs; }
+    public Options setDownloadReadTimeoutMs(long value) { this.downloadReadTimeoutMs = value; return this; }
     public int getUploadChunkConcurrency() { return uploadChunkConcurrency; }
     public Options setUploadChunkConcurrency(int value) { this.uploadChunkConcurrency = value; return this; }
     public int getMaxChunkRetries() { return maxChunkRetries; }
@@ -229,6 +237,8 @@ public class Options {
         copy.callbackThreads = this.callbackThreads;
         copy.callbackQueueSize = this.callbackQueueSize;
         copy.maxDownloadBytes = this.maxDownloadBytes;
+        copy.downloadConnectTimeoutMs = this.downloadConnectTimeoutMs;
+        copy.downloadReadTimeoutMs = this.downloadReadTimeoutMs;
         copy.uploadChunkConcurrency = this.uploadChunkConcurrency;
         copy.maxChunkRetries = this.maxChunkRetries;
         copy.validate();

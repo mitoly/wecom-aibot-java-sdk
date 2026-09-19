@@ -41,20 +41,25 @@ final class MediaTransfer implements AutoCloseable {
         }catch(Exception e){return SdkFutures.failed(e);}
     }
     CompletionStage<UploadedMedia> upload(String type,Path path) {
-        return submit(() -> {
-            if(path==null)throw new AiBotException(AiBotException.Code.INVALID_ARGUMENT,"文件路径为空");
-            String filename=path.getFileName().toString();validateUpload(type,filename,Files.size(path));
-            byte[] bytes;
-            try(java.io.InputStream in=Files.newInputStream(path);java.io.ByteArrayOutputStream out=new java.io.ByteArrayOutputStream()) {
-                byte[] buffer=new byte[8192];int count;
-                while((count=in.read(buffer))!=-1) {if((long)out.size()+count>maximum(type))ProtocolValidator.invalid("文件读取超过类型上限");out.write(buffer,0,count);}
-                bytes=out.toByteArray();
-            }
-            validateUpload(type,filename,bytes.length);return transfer(type,filename,bytes);
-        });
+        try {
+            // 与 byte[] 重载一致：能在调用线程判定的入口校验先行，失败不占稀缺 io 槽位。
+            if(path==null)ProtocolValidator.invalid("文件路径为空");
+            Path fileName=path.getFileName();
+            if(fileName==null)ProtocolValidator.invalid("文件路径无效: "+path);
+            validateUploadMeta(type,fileName.toString());
+            return submit(() -> {
+                byte[] bytes;
+                try(java.io.InputStream in=Files.newInputStream(path);java.io.ByteArrayOutputStream out=new java.io.ByteArrayOutputStream()) {
+                    byte[] buffer=new byte[8192];int count;
+                    while((count=in.read(buffer))!=-1) {if((long)out.size()+count>maximum(type))ProtocolValidator.invalid("文件读取超过类型上限");out.write(buffer,0,count);}
+                    bytes=out.toByteArray();
+                }
+                validateUpload(type,fileName.toString(),bytes.length);return transfer(type,fileName.toString(),bytes);
+            });
+        }catch(Exception e){return SdkFutures.failed(e);}
     }
     CompletionStage<MediaUtils.DownloadResult> download(String url,String aesKey) {
-        return submit(() -> MediaUtils.downloadFile(url,aesKey,options.getMaxDownloadBytes(),timeout(options.getConnectTimeoutMs()),timeout(options.getRequestTimeoutMs())));
+        return submit(() -> MediaUtils.downloadFile(url,aesKey,options.getMaxDownloadBytes(),timeout(options.getDownloadConnectTimeoutMs()),timeout(options.getDownloadReadTimeoutMs())));
     }
     private static int timeout(long value){return (int)Math.min(Integer.MAX_VALUE,value);}
     private UploadedMedia transfer(String type,String filename,byte[] bytes) throws Exception {
@@ -112,8 +117,13 @@ final class MediaTransfer implements AutoCloseable {
     }
     static void validateUpload(String type,String filename,long size) throws AiBotException {
         long max=maximum(type);
-        if(filename==null||filename.trim().isEmpty()||filename.getBytes(StandardCharsets.UTF_8).length>256||filename.contains("/")||filename.contains("\\")||filename.matches(".*[\\r\\n\\x00].*"))ProtocolValidator.invalid("文件名无效");
         if(size<5||size>max)ProtocolValidator.invalid("文件大小超出媒体类型限制");
+        validateUploadMeta(type,filename);
+    }
+    /** 文件名/类型/扩展名校验（无需读文件，可在调用线程先行）。 */
+    static void validateUploadMeta(String type,String filename) throws AiBotException {
+        maximum(type);
+        if(filename==null||filename.trim().isEmpty()||filename.getBytes(StandardCharsets.UTF_8).length>256||filename.contains("/")||filename.contains("\\")||filename.matches(".*[\\r\\n\\x00].*"))ProtocolValidator.invalid("文件名无效");
         String lower=filename.toLowerCase(Locale.ROOT);
         if("image".equals(type)&&!(lower.endsWith(".png")||lower.endsWith(".jpg")||lower.endsWith(".jpeg")||lower.endsWith(".gif")))ProtocolValidator.invalid("图片格式不支持");
         if("voice".equals(type)&&!lower.endsWith(".amr"))ProtocolValidator.invalid("语音仅支持 AMR");

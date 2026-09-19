@@ -16,6 +16,7 @@ import java.util.function.BiConsumer;
 final class ConnectionManager implements AutoCloseable {
     private final Options options;
     private final java.util.function.LongSupplier clock;
+    private final AiBotLogger log;
     private final ObjectMapper mapper;
     private final OkHttpClient http;
     private final BiConsumer<String, Object> event;
@@ -62,6 +63,7 @@ final class ConnectionManager implements AutoCloseable {
         final long generation, deadline;
         final CompletableFuture<Frame> result;
         boolean sent;
+        String streamKey;
         ScheduledFuture<?> timeout;
         StreamState stream;
         Envelope(String cmd, String reqId, String target, JsonNode body, long generation, long deadline, CompletableFuture<Frame> result) {
@@ -82,7 +84,12 @@ final class ConnectionManager implements AutoCloseable {
     ConnectionManager(Options options, ObjectMapper mapper, OkHttpClient http,
                       BiConsumer<String, Object> event, java.util.function.Consumer<Frame> inbound,
                       SocketConnector connector, java.util.function.LongSupplier clock) {
-        this.options=options; this.mapper=mapper; this.http=http; this.event=event; this.inbound=inbound; this.connector=connector; this.clock=clock;
+        this(options,mapper,http,event,inbound,connector,clock,new AiBotLogger.Slf4jLogger());
+    }
+    ConnectionManager(Options options, ObjectMapper mapper, OkHttpClient http,
+                      BiConsumer<String, Object> event, java.util.function.Consumer<Frame> inbound,
+                      SocketConnector connector, java.util.function.LongSupplier clock, AiBotLogger log) {
+        this.options=options; this.mapper=mapper; this.http=http; this.event=event; this.inbound=inbound; this.connector=connector; this.clock=clock; this.log=log;
         capacity = new Semaphore(options.getMaxPendingRequests());
         lifecycle = Executors.newSingleThreadScheduledExecutor(threadFactory("wecom-lifecycle"));
         completions = Executors.newFixedThreadPool(2, threadFactory("wecom-completion"));
@@ -185,10 +192,14 @@ final class ConnectionManager implements AutoCloseable {
             Envelope item=queue.peekFirst();
             if (!valid) { poison(s,item,error(AiBotException.Code.UNKNOWN,"响应缺少有效 errcode，发送结果未知")); return; }
             queue.removeFirst(); cancel(item.timeout);
-            if (item.stream!=null && item.finalStream()) { item.stream.finishing=false; item.stream.finished=frame.getErrCode()==0; }
+            if (item.stream!=null && item.finalStream()) {
+                item.stream.finishing=false; item.stream.finished=frame.getErrCode()==0;
+                // finish 被服务端接受的流即刻回收槽位，长连接不再累积占满流会话容量。
+                if (frame.getErrCode()==0 && item.streamKey!=null) s.streams.remove(item.streamKey);
+            }
             complete(item,frame,frame.getErrCode()==0 ? null : rejection(frame));
             if (queue.isEmpty()) s.lanes.remove(reqId); else pump(s,queue);
-        } catch (Exception e) { event.accept(Constants.EVENT_ERROR,error(AiBotException.Code.PROTOCOL_ERROR,"帧解析失败")); }
+        } catch (Exception e) { event.accept(Constants.EVENT_ERROR,new AiBotException(AiBotException.Code.PROTOCOL_ERROR,"帧解析失败",e)); }
     }
     private void heartbeat(Session s) {
         if (!current(s) || state!=BotConnectionState.READY) return;
@@ -209,14 +220,16 @@ final class ConnectionManager implements AutoCloseable {
     private void enqueue(Envelope item) {
         Session s=active;
         if (s==null || !current(s) || state!=BotConnectionState.READY) { complete(item,null,error(AiBotException.Code.NOT_READY,"连接未就绪")); return; }
-        if (item.generation!=s.generation) { complete(item,null,error(AiBotException.Code.STALE_CONTEXT,"回调属于旧连接")); return; }
+        // generation>=0 表示回复路径透传的回调帧连接代；主动推送（新 req_id）传 -1，不参与代校验，避免与重连竞态误杀。
+        if (item.generation>=0 && item.generation!=s.generation) { complete(item,null,error(AiBotException.Code.STALE_CONTEXT,"回调属于旧连接")); return; }
         if (s.poisoned.contains(item.reqId)) { complete(item,null,error(AiBotException.Code.UNKNOWN,"该 req_id 已发生不确定结果，禁止继续发送")); return; }
-        if(clock.getAsLong()-item.deadline>=0) {complete(item,null,error(AiBotException.Code.DEADLINE_EXCEEDED,"回复窗口已过期"));return;}
-        s.streams.entrySet().removeIf(entry -> clock.getAsLong()-entry.getValue().expiresAt>=0);
+        if(clock.getAsLong()>=item.deadline) {complete(item,null,error(AiBotException.Code.DEADLINE_EXCEEDED,"回复窗口已过期"));return;}
+        s.streams.entrySet().removeIf(entry -> clock.getAsLong()>=entry.getValue().expiresAt || entry.getValue().finished);
         Deque<Envelope> queue=s.lanes.computeIfAbsent(item.reqId,k -> new ArrayDeque<>());
         if (queue.size()>=options.getMaxReplyQueueSize()) { complete(item,null,error(AiBotException.Code.QUEUE_FULL,"回复队列已满")); return; }
         if ("stream".equals(item.body.path("msgtype").asText())) {
             String key=item.reqId+":"+item.body.path("stream").path("id").asText();
+            item.streamKey=key;
             StreamState stream=s.streams.get(key);
             if (stream==null) {
                 if (s.streams.size()>=options.getMaxPendingRequests()) { if(queue.isEmpty())s.lanes.remove(item.reqId); complete(item,null,error(AiBotException.Code.QUEUE_FULL,"流会话容量已满")); return; }
@@ -231,9 +244,9 @@ final class ConnectionManager implements AutoCloseable {
         while (!queue.isEmpty()) {
             Envelope item=queue.peekFirst();
             try {
-                if (clock.getAsLong()-item.deadline>=0) throw error(AiBotException.Code.DEADLINE_EXCEEDED,"回复窗口已过期");
+                if (clock.getAsLong()>=item.deadline) throw error(AiBotException.Code.DEADLINE_EXCEEDED,"回复窗口已过期");
                 if (item.stream!=null && item.stream.started!=0 && clock.getAsLong()-item.stream.started>=TimeUnit.MINUTES.toNanos(10)) throw error(AiBotException.Code.DEADLINE_EXCEEDED,"流刷新超过十分钟");
-                if(item.stream!=null && item.stream.started!=0 && item.body.path("stream").has("feedback"))throw error(AiBotException.Code.INVALID_ARGUMENT,"feedback 只能在流的首帧设置");
+                if(item.stream!=null && item.stream.started!=0 && item.body.path("stream").has("feedback"))log.warn("流式续帧携带 feedback（官方未限制首帧，放行发送）: {}",item.streamKey);
                 if (item.target!=null) messages.acquire(item.target);
                 if (Constants.CMD_UPLOAD_MEDIA_INIT.equals(item.cmd)) uploads.acquire(options.getBotId());
                 long timeout=replyCommand(item.cmd) ? options.getReplyAckTimeoutMs() : options.getRequestTimeoutMs();
@@ -259,13 +272,17 @@ final class ConnectionManager implements AutoCloseable {
         if(s.poisoned.size()>=options.getMaxPendingRequests())end(s,error,false);
     }
     private void complete(Envelope item, Frame value, Throwable error) {
-        completions.execute(() -> {
+        completionsOrInline(() -> {
             try { if(error==null)item.result.complete(value); else item.result.completeExceptionally(error); }
             finally { capacity.release(); }
         });
     }
     private void completeControl(CompletableFuture<Void> future, Throwable error) {
-        completions.execute(() -> { if(error==null)future.complete(null); else future.completeExceptionally(error); });
+        completionsOrInline(() -> { if(error==null)future.complete(null); else future.completeExceptionally(error); });
+    }
+    /** 终态关闭后 completions 可能已 shutdown：回退到调用线程直接完成，保证 future 必达且容量必释放。 */
+    private void completionsOrInline(Runnable task) {
+        try { completions.execute(task); } catch (RejectedExecutionException e) { task.run(); }
     }
     private void write(Session s, Frame frame) throws IOException {
         if (!current(s) || s.socket==null) throw error(AiBotException.Code.NOT_READY,"连接已失效");

@@ -85,4 +85,66 @@ public class ConnectionManagerTest {
             try{racing.get().toCompletableFuture().get(2,TimeUnit.SECONDS);fail();}catch(ExecutionException expected){assertTrue(SdkFutures.unwrap(expected) instanceof AiBotException);}
         }finally{manager.close();}
     }
+
+    @Test public void generationGuardSkipsProactiveButStillGuardsReplyPath() throws Exception {
+        BlockingQueue<Socket> created=new LinkedBlockingQueue<>();
+        ConnectionManager manager=new ConnectionManager(new Options(),mapper,new OkHttpClient(),(event,payload)->{},frame->{},
+            (request,listener)->{Socket socket=new Socket(listener);created.add(socket);listener.onOpen(socket,null);return socket;});
+        try {
+            manager.start().toCompletableFuture().get(2,TimeUnit.SECONDS);Socket socket=created.poll(2,TimeUnit.SECONDS);
+            JsonNode body=mapper.valueToTree(ClientIntegrationTest.markdown("u","hi"));
+            // 主动推送语义（generation=-1）：接受发送
+            CompletionStage<Frame> proactive=manager.request(Constants.CMD_SEND_MSG,"p",body,"u",-1,Long.MAX_VALUE);
+            JsonNode sent=socket.frames.poll(2,TimeUnit.SECONDS);assertNotNull(sent);socket.ack(sent);
+            proactive.toCompletableFuture().get(2,TimeUnit.SECONDS);
+            // 回复路径语义（透传错误连接代）：仍被 STALE_CONTEXT 拦截
+            CompletionStage<Frame> stale=manager.request(Constants.CMD_RESPOND_MSG,"s",mapper.valueToTree(ClientIntegrationTest.markdown("u","reply")),"u",manager.generation()+1000,Long.MAX_VALUE);
+            try{stale.toCompletableFuture().get(2,TimeUnit.SECONDS);fail();}catch(ExecutionException e){assertEquals(AiBotException.Code.STALE_CONTEXT,((AiBotException)SdkFutures.unwrap(e)).getCode());}
+        }finally{manager.close();}
+    }
+
+    @Test public void negativeNanoTimeClockDoesNotExpireSentinelDeadline() throws Exception {
+        java.util.concurrent.atomic.AtomicLong clock=new java.util.concurrent.atomic.AtomicLong(-1_000_000_000L);
+        BlockingQueue<Socket> created=new LinkedBlockingQueue<>();
+        ConnectionManager manager=new ConnectionManager(new Options(),mapper,new OkHttpClient(),(event,payload)->{},frame->{},
+            (request,listener)->{Socket socket=new Socket(listener);created.add(socket);listener.onOpen(socket,null);return socket;},clock::get);
+        try {
+            manager.start().toCompletableFuture().get(2,TimeUnit.SECONDS);Socket socket=created.poll(2,TimeUnit.SECONDS);
+            CompletionStage<Frame> sent=manager.request(Constants.CMD_SEND_MSG,"n",mapper.valueToTree(ClientIntegrationTest.markdown("u","late")),"u",-1,Long.MAX_VALUE);
+            JsonNode frame=socket.frames.poll(2,TimeUnit.SECONDS);assertNotNull(frame); // 旧代码 now-Long.MAX_VALUE 回绕为正，帧在入口即被误判过期
+            socket.ack(frame);sent.toCompletableFuture().get(2,TimeUnit.SECONDS);
+        }finally{manager.close();}
+    }
+
+    private JsonNode streamFrame(String id,boolean finish,boolean withFeedback) throws Exception {
+        return mapper.readTree("{\"msgtype\":\"stream\",\"stream\":{\"id\":\""+id+"\",\"content\":\"x\",\"finish\":"+finish+(withFeedback?",\"feedback\":{\"id\":\"fb\"}":"")+"}}");
+    }
+    @Test public void finishedStreamReleasesCapacityImmediately() throws Exception {
+        BlockingQueue<Socket> created=new LinkedBlockingQueue<>();
+        ConnectionManager manager=new ConnectionManager(new Options().setMaxPendingRequests(1),mapper,new OkHttpClient(),(event,payload)->{},frame->{},
+            (request,listener)->{Socket socket=new Socket(listener);created.add(socket);listener.onOpen(socket,null);return socket;});
+        try {
+            manager.start().toCompletableFuture().get(2,TimeUnit.SECONDS);Socket socket=created.poll(2,TimeUnit.SECONDS);
+            CompletionStage<Frame> first=manager.request(Constants.CMD_RESPOND_MSG,"r",streamFrame("a",true,false),"u",manager.generation(),Long.MAX_VALUE);
+            socket.ack(socket.frames.poll(2,TimeUnit.SECONDS));first.toCompletableFuture().get(2,TimeUnit.SECONDS);
+            // 流 a finish 成功后槽位应即时回收：流 b（同 reqId 新 stream.id）可再入，未修复时为 QUEUE_FULL
+            CompletionStage<Frame> second=manager.request(Constants.CMD_RESPOND_MSG,"r",streamFrame("b",true,false),"u",manager.generation(),Long.MAX_VALUE);
+            socket.ack(socket.frames.poll(2,TimeUnit.SECONDS));second.toCompletableFuture().get(2,TimeUnit.SECONDS);
+        }finally{manager.close();}
+    }
+    @Test public void feedbackOnFollowUpFrameIsSentInsteadOfRejected() throws Exception {
+        BlockingQueue<Socket> created=new LinkedBlockingQueue<>();
+        ConnectionManager manager=new ConnectionManager(new Options(),mapper,new OkHttpClient(),(event,payload)->{},frame->{},
+            (request,listener)->{Socket socket=new Socket(listener);created.add(socket);listener.onOpen(socket,null);return socket;});
+        try {
+            manager.start().toCompletableFuture().get(2,TimeUnit.SECONDS);Socket socket=created.poll(2,TimeUnit.SECONDS);
+            CompletionStage<Frame> head=manager.request(Constants.CMD_RESPOND_MSG,"f",streamFrame("s",false,false),"u",manager.generation(),Long.MAX_VALUE);
+            socket.ack(socket.frames.poll(2,TimeUnit.SECONDS));head.toCompletableFuture().get(2,TimeUnit.SECONDS);
+            // 官方无"feedback 仅首帧"限制：续帧携带 feedback 应照常发送（旧代码 INVALID_ARGUMENT 拒绝）
+            CompletionStage<Frame> followUp=manager.request(Constants.CMD_RESPOND_MSG,"f",streamFrame("s",true,true),"u",manager.generation(),Long.MAX_VALUE);
+            JsonNode sent=socket.frames.poll(2,TimeUnit.SECONDS);assertNotNull(sent);
+            assertEquals("fb",sent.path("body").path("stream").path("feedback").path("id").asText());
+            socket.ack(sent);followUp.toCompletableFuture().get(2,TimeUnit.SECONDS);
+        }finally{manager.close();}
+    }
 }

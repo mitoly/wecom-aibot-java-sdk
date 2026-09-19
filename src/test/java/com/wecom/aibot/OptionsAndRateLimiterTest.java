@@ -13,6 +13,13 @@ public class OptionsAndRateLimiterTest {
         try{source.setHeartbeatIntervalMs(0).validate();fail();}catch(IllegalArgumentException expected){}
         try{new Options().setBotId(" ").setSecret("s").validate();fail();}catch(IllegalArgumentException expected){}
     }
+    @Test public void downloadTimeoutsDefaultToLegacyValuesAndSnapshot() throws Exception {
+        Options source=new Options().setBotId("bot").setSecret("secret").setDownloadConnectTimeoutMs(1234).setDownloadReadTimeoutMs(5678);
+        assertEquals(1234,source.getDownloadConnectTimeoutMs());assertEquals(5678,source.getDownloadReadTimeoutMs());
+        Options snapshot=source.snapshot();assertEquals(1234,snapshot.getDownloadConnectTimeoutMs());assertEquals(5678,snapshot.getDownloadReadTimeoutMs());
+        assertEquals(30000L,new Options().getDownloadConnectTimeoutMs());assertEquals(60000L,new Options().getDownloadReadTimeoutMs());
+        try{source.setDownloadReadTimeoutMs(0).validate();fail();}catch(IllegalArgumentException expected){}
+    }
     @Test public void minuteLimitAndRetryAfterUseRollingWindow() throws Exception {
         AtomicLong clock=new AtomicLong();RateLimiter limiter=new RateLimiter(clock::get);
         for(int i=0;i<30;i++)limiter.acquire("chat");

@@ -72,6 +72,10 @@ public class SendMsgBody {
         return text;
     }
 
+    /**
+     * 注意：主动推送（aibot_send_msg）不支持 text 消息，设置本字段发送必被校验拒绝；
+     * 纯文本场景请使用欢迎语回复（仅 enter_chat 事件）或 markdown。
+     */
     public void setText(TextContent text) {
         this.text = text;
     }

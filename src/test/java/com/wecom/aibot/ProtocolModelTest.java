@@ -57,6 +57,30 @@ public class ProtocolModelTest {
         try{ProtocolValidator.body(Constants.CMD_RESPOND_MSG,mapper.valueToTree(reply));fail();}catch(AiBotException expected){}
     }
 
+    @Test public void videoTitleAndDescriptionOverflowTruncateOnUtf8Boundary() throws Exception {
+        StringBuilder ascii=new StringBuilder();for(int i=0;i<65;i++)ascii.append('a');
+        StringBuilder cjk=new StringBuilder();for(int i=0;i<172;i++)cjk.append('中');
+        String raw="{\"msgtype\":\"video\",\"video\":{\"media_id\":\"m\",\"title\":\""+ascii+"\",\"description\":\""+cjk+"\"}}";
+        com.fasterxml.jackson.databind.node.ObjectNode body=(com.fasterxml.jackson.databind.node.ObjectNode)mapper.readTree(raw);
+        ProtocolValidator.body(Constants.CMD_RESPOND_MSG,body);
+        byte[] title=body.path("video").path("title").asText().getBytes("UTF-8");
+        byte[] description=body.path("video").path("description").asText().getBytes("UTF-8");
+        assertEquals(64,title.length);assertEquals(510,description.length); // 510=512 内最大 3 字节对齐，未截出半个字符
+        assertEquals(cjk.substring(0,170),body.path("video").path("description").asText());
+    }
+
+    @Test public void uploadInitAcceptsAnyChunkLayoutWithinOfficialLimits() throws Exception {
+        String raw="{\"type\":\"file\",\"filename\":\"a.pdf\",\"total_size\":23330,\"total_chunks\":100,\"md5\":\"0123456789abcdef0123456789abcdef\"}";
+        ProtocolValidator.body(Constants.CMD_UPLOAD_MEDIA_INIT,mapper.readTree(raw)); // 自定义更小分片合法：单片≤512KB 且总数≤100
+        try{ProtocolValidator.body(Constants.CMD_UPLOAD_MEDIA_INIT,mapper.readTree(raw.replace("\"total_chunks\":100","\"total_chunks\":101")));fail();}catch(AiBotException expected){assertEquals(AiBotException.Code.INVALID_ARGUMENT,expected.getCode());}
+    }
+
+    @Test public void sendMsgTextRejectionCarriesGuidance() throws Exception {
+        SendMsgBody body=new SendMsgBody();body.setChatId("u");body.setChatType(1);body.setMsgType("text");body.setText(new TextContent("hi"));
+        try{ProtocolValidator.body(Constants.CMD_SEND_MSG,mapper.valueToTree(body));fail();}
+        catch(AiBotException expected){assertTrue(expected.getMessage().contains("markdown"));}
+    }
+
     @Test public void officialMixedFieldAndLegacyAliasBothExposeOrderedItems() throws Exception {
         String items="[{\"msgtype\":\"text\",\"text\":{\"content\":\"caption\"}},{\"msgtype\":\"image\",\"image\":{\"url\":\"https://example.com/a\",\"aeskey\":\"key\"}}]";
         for(String field:Arrays.asList("msg_item","items")) {

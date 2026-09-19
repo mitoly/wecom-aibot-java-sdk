@@ -195,11 +195,28 @@ public class ClientIntegrationTest {
         server.enqueue(new MockResponse().setChunkedBody("123456",2));
         try{MediaUtils.downloadFile(server.url("/too-large").toString(),null,5,1000,1000);fail();}catch(java.io.IOException expected){}
     }
-    @Test public void streamFeedbackIsOnlyAcceptedOnFirstFrame() throws Exception {
+    @Test public void streamFeedbackIsAcceptedOnAnyFramePerOfficialDoc() throws Exception {
         upgrade();start(options());Frame callback=message("r");ReplyFeedback feedback=new ReplyFeedback();feedback.setId("f");
         client.replyStreamAsync(callback,"s","first",false,feedback).toCompletableFuture().get(2,TimeUnit.SECONDS);
-        assertEquals(AiBotException.Code.INVALID_ARGUMENT,((AiBotException)failure(client.replyStreamAsync(callback,"s","second",true,feedback))).getCode());
-        client.replyStreamAsync(callback,"s","done",true).toCompletableFuture().get(2,TimeUnit.SECONDS);
+        // 官方文档未限制 feedback 仅首帧：续帧携带 feedback 应照常发送成功
+        client.replyStreamAsync(callback,"s","second",true,feedback).toCompletableFuture().get(2,TimeUnit.SECONDS);
+    }
+    @Test public void uploadRootPathFailsFastWithoutOccupyingTaskSlot() throws Exception {
+        upgrade();start(options());
+        CompletionStage<?> stage=client.uploadMediaAsync("file",java.nio.file.Paths.get("/"));
+        assertTrue(stage.toCompletableFuture().isDone()); // 调用线程同步失败，不占媒体任务槽位
+        AiBotException error=(AiBotException)failure(stage);
+        assertEquals(AiBotException.Code.INVALID_ARGUMENT,error.getCode());
+    }
+    @Test public void handlerExceptionCarriesThrowableToEventErrorHandler() throws Exception {
+        upgrade();start(options());
+        AtomicReference<Throwable> captured=new AtomicReference<>();
+        client.setEventErrorHandler((event,error)->captured.compareAndSet(null,error));
+        client.on(Constants.EVENT_MESSAGE_TEXT,(frame,body)->{throw new IllegalStateException("boom");});
+        message("err-req");
+        long until=System.nanoTime()+TimeUnit.SECONDS.toNanos(2);
+        while(captured.get()==null&&System.nanoTime()<until)Thread.sleep(5);
+        assertNotNull(captured.get());assertEquals("boom",captured.get().getMessage());
     }
 
     @Test public void normalCloseDoesNotLookLikeCallbackOverloadAndRunInterruptCloses() throws Exception {

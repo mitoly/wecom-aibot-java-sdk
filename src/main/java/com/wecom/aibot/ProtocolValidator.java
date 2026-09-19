@@ -28,7 +28,7 @@ final class ProtocolValidator {
             if(!body.path("total_size").isIntegralNumber() || !body.path("total_size").canConvertToLong())invalid("total_size 必须为整数");
             MediaTransfer.validateUpload(body.path("type").asText(),body.path("filename").asText(),body.path("total_size").asLong());
             int chunks=body.path("total_chunks").asInt();
-            if(!body.path("total_chunks").isIntegralNumber() || chunks<1 || chunks>100 || chunks!=(body.path("total_size").asLong()+Constants.UPLOAD_CHUNK_SIZE-1)/Constants.UPLOAD_CHUNK_SIZE)invalid("分片数量无效");
+            if(!body.path("total_chunks").isIntegralNumber() || chunks<1 || chunks>100)invalid("分片数量无效");
             if(body.has("md5") && !body.path("md5").asText().matches("[0-9a-fA-F]{32}"))invalid("MD5 无效");return;
         }
         if(Constants.CMD_UPLOAD_MEDIA_CHUNK.equals(cmd)) {
@@ -45,6 +45,8 @@ final class ProtocolValidator {
         String type=body.path("msgtype").asText();
         if(welcome) {
             if(!"text".equals(type) && !"template_card".equals(type))invalid("欢迎语仅支持 text/template_card");
+        } else if("text".equals(type) && Constants.CMD_SEND_MSG.equals(cmd)) {
+            invalid("主动推送不支持 text；纯文本请用欢迎语回复（replyWelcomeAsync）或 markdown");
         } else if(!ORDINARY.contains(type) || (Constants.CMD_SEND_MSG.equals(cmd) && "stream".equals(type)))invalid("长连接不支持该消息类型");
         if(Constants.CMD_SEND_MSG.equals(cmd)) {
             text(body.path("chatid"),256,true,"chatid");
@@ -61,7 +63,7 @@ final class ProtocolValidator {
         } else if("template_card".equals(type))card(content);
         else {
             text(content.path("media_id"),4096,true,"media_id");
-            if("video".equals(type)) {text(content.path("title"),64,false,"title");text(content.path("description"),512,false,"description");}
+            if("video".equals(type)) {requireTextual(content.path("title"),"title");requireTextual(content.path("description"),"description");truncateUtf8(content,"title",64);truncateUtf8(content,"description",512);}
         }
         if(content.has("feedback"))text(content.path("feedback").path("id"),256,true,"feedback.id");
     }
@@ -88,6 +90,25 @@ final class ProtocolValidator {
     static void text(JsonNode value,int max,boolean required,String field) throws AiBotException {
         if(value.isMissingNode() || value.isNull()) {if(required)invalid(field+" 不能为空");return;}
         if(!value.isTextual() || (required && value.asText().trim().isEmpty()) || value.asText().getBytes(StandardCharsets.UTF_8).length>max)invalid(field+" 类型或 UTF-8 字节数无效");
+    }
+    private static void requireTextual(JsonNode value,String field) throws AiBotException {
+        if(!value.isMissingNode() && !value.isNull() && !value.isTextual())invalid(field+" 类型无效");
+    }
+    /** 官方语义：视频标题/描述超长自动截断，按 UTF-8 码点边界不截半个字符；只改可变节点。 */
+    private static void truncateUtf8(JsonNode node,String field,int maxBytes) throws AiBotException {
+        if(!(node instanceof com.fasterxml.jackson.databind.node.ObjectNode))return;
+        JsonNode value=node.path(field);
+        if(!value.isTextual())return;
+        String text=value.asText();
+        if(text.getBytes(StandardCharsets.UTF_8).length<=maxBytes)return;
+        StringBuilder kept=new StringBuilder();int used=0,i=0;
+        while(i<text.length()) {
+            int code=text.codePointAt(i);
+            int size=new String(Character.toChars(code)).getBytes(StandardCharsets.UTF_8).length;
+            if(used+size>maxBytes)break;
+            kept.appendCodePoint(code);used+=size;i+=Character.charCount(code);
+        }
+        ((com.fasterxml.jackson.databind.node.ObjectNode)node).put(field,kept.toString());
     }
     static void invalid(String message) throws AiBotException {throw new AiBotException(AiBotException.Code.INVALID_ARGUMENT,message);}
 }
