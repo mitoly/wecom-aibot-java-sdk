@@ -6,7 +6,7 @@
 
     <groupId>com.wecom</groupId>
     <artifactId>wecom-aibot-java-sdk</artifactId>
-    <version>1.2.0-SNAPSHOT</version>
+    <version>1.2.0</version>
     <packaging>jar</packaging>
 
     <name>WeCom AiBot Java SDK</name>
