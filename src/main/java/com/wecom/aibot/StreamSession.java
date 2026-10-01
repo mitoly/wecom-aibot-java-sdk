@@ -16,7 +16,7 @@ public class StreamSession {
     private final Frame frame;
     private final String streamId;
     private final Object lock=new Object();
-    StreamSession(WeComAiBotClient client,Frame frame,String streamId,AiBotLogger log) {this.client=client;this.frame=frame;this.streamId=streamId;}
+    StreamSession(WeComAiBotClient client,Frame frame,String streamId) {this.client=client;this.frame=frame;this.streamId=streamId;}
     public String getId(){return streamId;}
     public State getState(){
         StreamRegistry registry=client.streamRegistry();

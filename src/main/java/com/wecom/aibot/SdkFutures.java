@@ -18,11 +18,6 @@ final class SdkFutures {
         }
         catch (InterruptedException e) { Thread.currentThread().interrupt(); throw e; }
     }
-    static <T> T awaitStrict(CompletionStage<T> stage) throws IOException, InterruptedException {
-        try { return stage.toCompletableFuture().get(); }
-        catch(ExecutionException e) {Throwable cause=unwrap(e);if(cause instanceof IOException)throw (IOException)cause;throw new IOException("SDK 操作失败",cause);}
-        catch(InterruptedException e) {Thread.currentThread().interrupt();throw e;}
-    }
     static <T> T awaitIo(CompletionStage<T> stage) throws IOException {
         try { return await(stage); }
         catch (InterruptedException e) { throw new IOException("等待被中断；已发送请求可能仍在执行", e); }

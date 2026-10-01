@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 流会话状态的唯一记账（client 级，跨连接存活）。
@@ -19,8 +20,9 @@ import java.util.concurrent.ConcurrentHashMap;
  * 结构性修改（put/remove）仅 lifecycle 单线程执行，{@link ConcurrentHashMap} 只提供内存可见性，
  * 不引入新锁节点——现有锁序（StreamSession.lock → CM monitor → readyLock）保持不变、无环。
  *
- * <p>字段语义：startedAt/streamExpiresAt 是 10 分钟流刷新窗口（跨连接连续计时，对齐官方
- * "从发送开始计时"）；replyDeadline 是回复窗口（24h/5s），仅用于过期回收；poisoned 按
+ * <p>字段语义：startedAt 是 10 分钟流刷新窗口的起点（跨连接连续计时，对齐官方
+ * "从发送开始计时"；窗口 = startedAt + Constants.STREAM_MAX_DURATION_MS，由 {@link #windowExpired} 统一裁决）；
+ * replyDeadline 是回复窗口（24h/5s），仅用于过期回收；poisoned 按
  * req_id 维度跨连接记录——ACK 结果未知的 req_id 禁止续发，重连不豁免（防重复发送）。
  */
 final class StreamRegistry {
@@ -39,10 +41,14 @@ final class StreamRegistry {
     /** 流 key 的唯一编码点（StreamSession 与 admit 共用，防止格式漂移）。 */
     static String key(String reqId,String streamId) { return reqId+":"+streamId; }
 
+    /** stream 体 finish 标志的唯一提取点（Envelope 与 admit 共用，防止路径漂移）。 */
+    static boolean isFinishFrame(JsonNode body) { return body!=null && body.path("stream").path("finish").asBoolean(); }
+
     private final ConcurrentHashMap<String,Entry> streams=new ConcurrentHashMap<>();
     private final Set<String> poisoned=ConcurrentHashMap.newKeySet();
     private final int maxActive;
     private int active; // 仅 lifecycle 线程访问：未终结（!finished）流条目计数，即流会话容量
+    private long lastCleanupNanos; // 仅 lifecycle 线程访问
 
     StreamRegistry(int maxActive) { this.maxActive=maxActive; }
 
@@ -60,7 +66,7 @@ final class StreamRegistry {
             streams.put(key,current);active++;
         }
         if(current.finishing||current.finished)throw new AiBotException(AiBotException.Code.INVALID_ARGUMENT,"流已结束或正在结束");
-        if(body.path("stream").path("finish").asBoolean())
+        if(isFinishFrame(body))
             streams.put(key,new Entry(current.startedAt,current.replyDeadline,true,current.finished));
         return key;
     }
@@ -102,8 +108,10 @@ final class StreamRegistry {
     boolean isPoisoned(String reqId) { return poisoned.contains(reqId); }
     int poisonedCount() { return poisoned.size(); }
 
-    /** 回复窗口过期或已终结条目的回收（仅未终结条目占容量）。 */
+    /** 回复窗口过期或已终结条目的回收（仅未终结条目占容量）；全表扫描至多每秒一次。 */
     void cleanup(long now) {
+        if(now-lastCleanupNanos<TimeUnit.SECONDS.toNanos(1))return;
+        lastCleanupNanos=now;
         for(java.util.Map.Entry<String,Entry> entry:streams.entrySet()) {
             Entry value=entry.getValue();
             if(now>=value.replyDeadline) {
@@ -114,6 +122,11 @@ final class StreamRegistry {
 
     /** 无锁读：流窗口起点；无记录或未发送返回 0。 */
     long startedAt(String key) { Entry e=key==null?null:streams.get(key); return e==null?0:e.startedAt; }
+    /** 无锁读：10 分钟流刷新窗口是否已过（未写过 socket 的流不计，窗口未起算）。 */
+    boolean windowExpired(String key,long now) {
+        Entry e=key==null?null:streams.get(key);
+        return e!=null && e.startedAt!=0 && now-e.startedAt>=TimeUnit.MILLISECONDS.toNanos(Constants.STREAM_MAX_DURATION_MS);
+    }
     /** 无锁读：条目快照（不可变）。 */
     Entry snapshot(String key) { return key==null?null:streams.get(key); }
 }

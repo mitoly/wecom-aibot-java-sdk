@@ -4,13 +4,24 @@ import com.fasterxml.jackson.databind.JsonNode;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.Locale;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 /** 根据长连接文档校验实际发送 JSON，而不是只校验便捷方法。 */
 final class ProtocolValidator {
-    private static final Set<String> ORDINARY = new HashSet<>(Arrays.asList("stream","markdown","template_card","image","file","voice","video"));
+    private static final Set<String> ORDINARY = new HashSet<>(Arrays.asList(Constants.MSG_TYPE_STREAM,Constants.MSG_TYPE_MARKDOWN,Constants.MSG_TYPE_CARD,Constants.MSG_TYPE_IMAGE,Constants.MSG_TYPE_FILE,Constants.MSG_TYPE_VOICE,Constants.MSG_TYPE_VIDEO));
     private static final Set<String> CARDS = new HashSet<>(Arrays.asList("text_notice","news_notice","button_interaction","vote_interaction","multiple_interaction"));
+    /** 可经 sendAsync 直发的命令白名单：其余命令由连接管理或回调回复入口处理，未知命令默认拒绝。 */
+    private static final Set<String> SENDABLE = new HashSet<>(Arrays.asList(Constants.CMD_SEND_MSG,Constants.CMD_UPLOAD_MEDIA_INIT,Constants.CMD_UPLOAD_MEDIA_CHUNK,Constants.CMD_UPLOAD_MEDIA_FINISH));
+    private static final Pattern MD5 = Pattern.compile("[0-9a-fA-F]{32}");
+    private static final Pattern TASK_ID_CHARS = Pattern.compile("[A-Za-z0-9_@-]+");
+    private static final Pattern FILENAME_CTRL = Pattern.compile(".*[\\r\\n\\x00].*");
     private ProtocolValidator() {}
+    /** sendAsync 入口命令白名单判定（fail-closed）。 */
+    static void assertSendable(String cmd) throws AiBotException { if(!SENDABLE.contains(cmd))invalid("该命令由连接管理或回调回复入口处理"); }
+    /** 回复类命令（共用 ACK 收窄与回复窗口语义）。 */
+    static boolean isReplyCommand(String cmd) { return Constants.CMD_RESPOND_MSG.equals(cmd)||Constants.CMD_RESPOND_UPDATE_MSG.equals(cmd)||Constants.CMD_RESPOND_WELCOME_MSG.equals(cmd); }
     static void body(String cmd, JsonNode body) throws AiBotException {
         if(body==null || !body.isObject())invalid("消息体必须为对象");
         if(Constants.CMD_RESPOND_UPDATE_MSG.equals(cmd)) {
@@ -26,10 +37,10 @@ final class ProtocolValidator {
         if(Constants.CMD_PING.equals(cmd))return;
         if(Constants.CMD_UPLOAD_MEDIA_INIT.equals(cmd)) {
             if(!body.path("total_size").isIntegralNumber() || !body.path("total_size").canConvertToLong())invalid("total_size 必须为整数");
-            MediaTransfer.validateUpload(body.path("type").asText(),body.path("filename").asText(),body.path("total_size").asLong());
+            validateUpload(body.path("type").asText(),body.path("filename").asText(),body.path("total_size").asLong());
             int chunks=body.path("total_chunks").asInt();
             if(!body.path("total_chunks").isIntegralNumber() || chunks<1 || chunks>100)invalid("分片数量无效");
-            if(body.has("md5") && !body.path("md5").asText().matches("[0-9a-fA-F]{32}"))invalid("MD5 无效");return;
+            if(body.has("md5") && !MD5.matcher(body.path("md5").asText()).matches())invalid("MD5 无效");return;
         }
         if(Constants.CMD_UPLOAD_MEDIA_CHUNK.equals(cmd)) {
             text(body.path("upload_id"),256,true,"upload_id");
@@ -44,32 +55,32 @@ final class ProtocolValidator {
         if(!welcome && !Constants.CMD_RESPOND_MSG.equals(cmd) && !Constants.CMD_SEND_MSG.equals(cmd))invalid("未知发送命令");
         String type=body.path("msgtype").asText();
         if(welcome) {
-            if(!"text".equals(type) && !"template_card".equals(type))invalid("欢迎语仅支持 text/template_card");
-        } else if("text".equals(type) && Constants.CMD_SEND_MSG.equals(cmd)) {
+            if(!Constants.MSG_TYPE_TEXT.equals(type) && !Constants.MSG_TYPE_CARD.equals(type))invalid("欢迎语仅支持 text/template_card");
+        } else if(Constants.MSG_TYPE_TEXT.equals(type) && Constants.CMD_SEND_MSG.equals(cmd)) {
             invalid("主动推送不支持 text；纯文本请用欢迎语回复（replyWelcomeAsync）或 markdown");
-        } else if(!ORDINARY.contains(type) || (Constants.CMD_SEND_MSG.equals(cmd) && "stream".equals(type)))invalid("长连接不支持该消息类型");
+        } else if(!ORDINARY.contains(type) || (Constants.CMD_SEND_MSG.equals(cmd) && Constants.MSG_TYPE_STREAM.equals(type)))invalid("长连接不支持该消息类型");
         if(Constants.CMD_SEND_MSG.equals(cmd)) {
             text(body.path("chatid"),256,true,"chatid");
             if(body.has("chat_type") && (!body.path("chat_type").isIntegralNumber() || body.path("chat_type").asInt()<0 || body.path("chat_type").asInt()>2))invalid("chat_type 无效");
         }
         JsonNode content=body.path(type);if(!content.isObject())invalid("缺少消息内容: "+type);
-        if("text".equals(type) || "markdown".equals(type) || "stream".equals(type)) {
+        if(Constants.MSG_TYPE_TEXT.equals(type) || Constants.MSG_TYPE_MARKDOWN.equals(type) || Constants.MSG_TYPE_STREAM.equals(type)) {
             text(content.path("content"),20480,!"stream".equals(type),"content");
-            if("stream".equals(type)) {
+            if(Constants.MSG_TYPE_STREAM.equals(type)) {
                 text(content.path("id"),256,true,"stream.id");
                 if(content.has("msg_item"))invalid("长连接暂不支持 msg_item");
                 if(content.has("finish") && !content.path("finish").isBoolean())invalid("finish 必须为布尔值");
             }
-        } else if("template_card".equals(type))card(content);
+        } else if(Constants.MSG_TYPE_CARD.equals(type))card(content);
         else {
             text(content.path("media_id"),4096,true,"media_id");
-            if("video".equals(type)) {requireTextual(content.path("title"),"title");requireTextual(content.path("description"),"description");truncateUtf8(content,"title",64);truncateUtf8(content,"description",512);}
+            if(Constants.MSG_TYPE_VIDEO.equals(type)) {requireTextual(content.path("title"),"title");requireTextual(content.path("description"),"description");truncateUtf8(content,"title",64);truncateUtf8(content,"description",512);}
         }
         if(content.has("feedback"))text(content.path("feedback").path("id"),256,true,"feedback.id");
     }
     static void card(JsonNode card) throws AiBotException {
         if(!card.isObject() || !CARDS.contains(card.path("card_type").asText()))invalid("卡片类型无效");
-        if(card.has("task_id")) {text(card.path("task_id"),128,true,"task_id");if(!card.path("task_id").asText().matches("[A-Za-z0-9_@-]+"))invalid("task_id 含非法字符");}
+        if(card.has("task_id")) {text(card.path("task_id"),128,true,"task_id");if(!TASK_ID_CHARS.matcher(card.path("task_id").asText()).matches())invalid("task_id 含非法字符");}
         limit(card,"horizontal_content_list",6);limit(card,"jump_list",3);limit(card,"vertical_content_list",4);limit(card,"button_list",6);limit(card,"select_list",3);
         if(card.has("button_list")) for(JsonNode button:card.get("button_list")) {text(button.path("text"),256,true,"button.text");text(button.path("key"),1024,true,"button.key");}
         if(card.has("select_list"))for(JsonNode selection:card.get("select_list"))selection(selection,10);
@@ -111,4 +122,26 @@ final class ProtocolValidator {
         ((com.fasterxml.jackson.databind.node.ObjectNode)node).put(field,kept.toString());
     }
     static void invalid(String message) throws AiBotException {throw new AiBotException(AiBotException.Code.INVALID_ARGUMENT,message);}
+
+    static void validateUpload(String type,String filename,long size) throws AiBotException {
+        long max=maximum(type);
+        if(size<5||size>max)invalid("文件大小超出媒体类型限制");
+        validateUploadMeta(type,filename);
+    }
+    /** 文件名/类型/扩展名校验（无需读文件，可在调用线程先行）。 */
+    static void validateUploadMeta(String type,String filename) throws AiBotException {
+        maximum(type);
+        if(filename==null||filename.trim().isEmpty()||filename.getBytes(StandardCharsets.UTF_8).length>256||filename.contains("/")||filename.contains("\\")||FILENAME_CTRL.matcher(filename).matches())invalid("文件名无效");
+        String lower=filename.toLowerCase(Locale.ROOT);
+        if(Constants.MSG_TYPE_IMAGE.equals(type)&&!(lower.endsWith(".png")||lower.endsWith(".jpg")||lower.endsWith(".jpeg")||lower.endsWith(".gif")))invalid("图片格式不支持");
+        if(Constants.MSG_TYPE_VOICE.equals(type)&&!lower.endsWith(".amr"))invalid("语音仅支持 AMR");
+        if(Constants.MSG_TYPE_VIDEO.equals(type)&&!lower.endsWith(".mp4"))invalid("视频仅支持 MP4");
+    }
+    /** 官方媒体类型大小上限（也是媒体类型白名单的唯一裁决点）。 */
+    static long maximum(String type) throws AiBotException {
+        if(Constants.MSG_TYPE_FILE.equals(type))return 20*1024*1024L;
+        if(Constants.MSG_TYPE_IMAGE.equals(type)||Constants.MSG_TYPE_VIDEO.equals(type))return 10*1024*1024L;
+        if(Constants.MSG_TYPE_VOICE.equals(type))return 2*1024*1024L;
+        throw new AiBotException(AiBotException.Code.INVALID_ARGUMENT,"媒体类型无效");
+    }
 }

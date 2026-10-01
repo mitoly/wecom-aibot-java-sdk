@@ -44,10 +44,10 @@ public class Options {
     private int maxPendingRequests = 1024;
     private int callbackThreads = 4;
     private int callbackQueueSize = 256;
-    private long maxDownloadBytes = 20 * 1024 * 1024L + 32;
+    private long maxDownloadBytes = Constants.DEFAULT_MAX_DOWNLOAD_BYTES;
     // 下载独立超时：弱网大文件读取远慢于控制帧，不复用 requestTimeoutMs（对齐旧版 30s/60s）
-    private long downloadConnectTimeoutMs = 30000L;
-    private long downloadReadTimeoutMs = 60000L;
+    private long downloadConnectTimeoutMs = Constants.DEFAULT_DOWNLOAD_CONNECT_TIMEOUT_MS;
+    private long downloadReadTimeoutMs = Constants.DEFAULT_DOWNLOAD_READ_TIMEOUT_MS;
     private int uploadChunkConcurrency = 2;
     private int maxChunkRetries = 2;
 

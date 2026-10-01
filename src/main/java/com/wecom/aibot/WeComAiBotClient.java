@@ -85,12 +85,11 @@ public class WeComAiBotClient implements AutoCloseable {
     /** 高级发送入口；回调回复请使用 replyAsync，以便透传 req_id 与检查上下文。 */
     public CompletionStage<Frame> sendAsync(String cmd,Object body) {
         try {
-            if(Constants.CMD_RESPOND_MSG.equals(cmd)||Constants.CMD_RESPOND_UPDATE_MSG.equals(cmd)||Constants.CMD_RESPOND_WELCOME_MSG.equals(cmd)
-                    ||Constants.CMD_SUBSCRIBE.equals(cmd)||Constants.CMD_PING.equals(cmd))ProtocolValidator.invalid("该命令由连接管理或回调回复入口处理");
-            JsonNode json=mapper.valueToTree(body); ProtocolValidator.body(cmd,json);
+            ProtocolValidator.assertSendable(cmd);
+            // 用户直接传入的 JsonNode 在校验前深拷贝归 SDK 独占（后续校验可能截断改写节点）；其余经 valueToTree 生成新树。
+            JsonNode json=body instanceof JsonNode ? ((JsonNode)body).deepCopy() : mapper.valueToTree(body); ProtocolValidator.body(cmd,json);
             String target=Constants.CMD_SEND_MSG.equals(cmd)?target(json):null;
-            // 主动推送使用新生成 req_id，不绑定回调连接代；-1 跳过代校验，重连瞬间不受 STALE_CONTEXT 误杀。
-            return connection.request(cmd,generateReqId(cmd),json,target,-1,Long.MAX_VALUE);
+            return connection.request(cmd,generateReqId(cmd),json,target);
         } catch(Exception e){return SdkFutures.failed(e);}
     }
     @Deprecated
@@ -102,26 +101,25 @@ public class WeComAiBotClient implements AutoCloseable {
             String reqId=callback.getHeaders().getReqId();
             ProtocolValidator.text(mapper.valueToTree(reqId),256,true,"req_id");
             JsonNode json=mapper.valueToTree(body); ProtocolValidator.body(cmd,json);
-            String event=callback.getBody().path("event").path("eventtype").asText();
             long window;
             if(Constants.CMD_RESPOND_MSG.equals(cmd)) {
                 if(!Constants.CMD_MSG_CALLBACK.equals(callback.getCmd()))ProtocolValidator.invalid("普通回复只能用于消息回调");
-                window=TimeUnit.HOURS.toNanos(24);
+                window=Constants.REPLY_WINDOW_NANOS;
             } else {
+                EventInfo info=mapper.treeToValue(callback.getBody(),EventCallbackBody.class).getEvent();
                 String required=Constants.CMD_RESPOND_WELCOME_MSG.equals(cmd)?Constants.EVENT_TYPE_ENTER_CHAT:Constants.EVENT_TYPE_TEMPLATE_CARD;
-                if(!Constants.CMD_EVENT_CALLBACK.equals(callback.getCmd()) || !required.equals(event))ProtocolValidator.invalid("命令与事件类型不匹配");
+                if(!Constants.CMD_EVENT_CALLBACK.equals(callback.getCmd()) || info==null || !required.equals(info.getEventType()))ProtocolValidator.invalid("命令与事件类型不匹配");
                 if(Constants.CMD_RESPOND_UPDATE_MSG.equals(cmd)) {
-                    JsonNode eventBody=callback.getBody().path("event");
-                    String task=eventBody.path("template_card_event").path("task_id").asText(eventBody.path("task_id").asText());
-                    if(task.isEmpty() || !task.equals(json.path("template_card").path("task_id").asText()))ProtocolValidator.invalid("更新卡片 task_id 必须与点击事件一致");
+                    String task=info.getTaskId();
+                    if(task==null || task.isEmpty() || !task.equals(json.path("template_card").path("task_id").asText()))ProtocolValidator.invalid("更新卡片 task_id 必须与点击事件一致");
                 }
-                window=TimeUnit.SECONDS.toNanos(5);
+                window=Constants.EVENT_REPLY_WINDOW_NANOS;
             }
             return connection.request(cmd,reqId,json,callbackTarget(callback.getBody()),callback.getGeneration(),callback.getReceivedNanos()+window);
         } catch(Exception e){return SdkFutures.failed(e);}
     }
     private static String callbackTarget(JsonNode body) throws AiBotException {
-        boolean group="group".equals(body.path("chattype").asText());
+        boolean group=Constants.CHAT_TYPE_GROUP.equals(body.path("chattype").asText());
         String id=group?body.path("chatid").asText():body.path("from").path("userid").asText();
         if(id.isEmpty())ProtocolValidator.invalid("回调缺少会话目标");
         return id;
@@ -137,17 +135,17 @@ public class WeComAiBotClient implements AutoCloseable {
     @Deprecated
     public void replyText(Frame callback,String content) throws IOException {SdkFutures.awaitIo(replyTextAsync(callback,content));}
     public CompletionStage<Frame> replyMarkdownAsync(Frame callback,String content) {
-        ReplyBody body=new ReplyBody();body.setMsgType("markdown");body.setMarkdown(new MarkdownContent(content));return replyAsync(callback,body);
+        ReplyBody body=new ReplyBody();body.setMsgType(Constants.MSG_TYPE_MARKDOWN);body.setMarkdown(new MarkdownContent(content));return replyAsync(callback,body);
     }
     @Deprecated
     public void replyMarkdown(Frame callback,String content) throws IOException {SdkFutures.awaitIo(replyMarkdownAsync(callback,content));}
     public CompletionStage<Frame> replyStreamAsync(Frame callback,String id,String content,boolean finish) {return replyStreamAsync(callback,id,content,finish,null);}
     public CompletionStage<Frame> replyStreamAsync(Frame callback,String id,String content,boolean finish,ReplyFeedback feedback) {
-        ReplyBody body=new ReplyBody();body.setMsgType("stream");StreamContent stream=new StreamContent(id,finish,content);stream.setFeedback(feedback);body.setStream(stream);return replyAsync(callback,body);
+        ReplyBody body=new ReplyBody();body.setMsgType(Constants.MSG_TYPE_STREAM);StreamContent stream=new StreamContent(id,finish,content);stream.setFeedback(feedback);body.setStream(stream);return replyAsync(callback,body);
     }
     @Deprecated
     public void replyStream(Frame callback,String id,String content,boolean finish) throws IOException {SdkFutures.awaitIo(replyStreamAsync(callback,id,content,finish));}
-    public CompletionStage<Frame> replyTemplateCardAsync(Frame callback,TemplateCard card) {ReplyBody body=new ReplyBody();body.setMsgType("template_card");body.setTemplateCard(card);return replyAsync(callback,body);}
+    public CompletionStage<Frame> replyTemplateCardAsync(Frame callback,TemplateCard card) {ReplyBody body=new ReplyBody();body.setMsgType(Constants.MSG_TYPE_CARD);body.setTemplateCard(card);return replyAsync(callback,body);}
     @Deprecated
     public void replyTemplateCard(Frame callback,TemplateCard card) throws IOException {SdkFutures.awaitIo(replyTemplateCardAsync(callback,card));}
     public CompletionStage<Frame> replyWelcomeAsync(Frame callback,ReplyBody body) {return replyCommand(callback,body,Constants.CMD_RESPOND_WELCOME_MSG);}
@@ -165,25 +163,33 @@ public class WeComAiBotClient implements AutoCloseable {
     @Deprecated
     public void sendMessage(SendMsgBody body) throws IOException,TimeoutException,InterruptedException {SdkFutures.await(sendMessageAsync(body));}
     public CompletionStage<Frame> sendMarkdownAsync(String chatId,int chatType,String content) {
-        SendMsgBody body=new SendMsgBody();body.setChatId(chatId);body.setChatType(chatType);body.setMsgType("markdown");body.setMarkdown(new MarkdownContent(content));return sendMessageAsync(body);
+        SendMsgBody body=new SendMsgBody();body.setChatId(chatId);body.setChatType(chatType);body.setMsgType(Constants.MSG_TYPE_MARKDOWN);body.setMarkdown(new MarkdownContent(content));return sendMessageAsync(body);
     }
     @Deprecated
     public void sendMarkdown(String chatId,int chatType,String content) throws IOException,TimeoutException,InterruptedException {SdkFutures.await(sendMarkdownAsync(chatId,chatType,content));}
     public CompletionStage<Frame> replyMediaAsync(Frame callback,String type,String mediaId) {return replyMediaAsync(callback,type,mediaId,null,null);}
     public CompletionStage<Frame> replyMediaAsync(Frame callback,String type,String mediaId,String title,String description) {
-        if(type==null)return SdkFutures.failed(new AiBotException(AiBotException.Code.INVALID_ARGUMENT,"媒体类型为空"));
-        ReplyBody body=new ReplyBody();body.setMsgType(type);MediaContent value=new MediaContent(mediaId);value.setTitle(title);value.setDescription(description);
-        switch(type){case "image":body.setImage(value);break;case "file":body.setFile(value);break;case "voice":body.setVoice(value);break;case "video":body.setVideo(value);break;default:return SdkFutures.failed(new AiBotException(AiBotException.Code.INVALID_ARGUMENT,"媒体类型无效"));}
-        return replyAsync(callback,body);
+        try {
+            ReplyBody body=new ReplyBody();body.setMsgType(type);MediaContent value=media(type,mediaId,title,description);
+            switch(type){case Constants.MSG_TYPE_IMAGE:body.setImage(value);break;case Constants.MSG_TYPE_FILE:body.setFile(value);break;case Constants.MSG_TYPE_VOICE:body.setVoice(value);break;case Constants.MSG_TYPE_VIDEO:body.setVideo(value);break;default:ProtocolValidator.invalid("媒体类型无效");}
+            return replyAsync(callback,body);
+        } catch(Exception e){return SdkFutures.failed(e);}
+    }
+    /** 媒体类型校验 + 媒体内容构造（reply/send 两路共用）。 */
+    private static MediaContent media(String type,String mediaId,String title,String description) throws AiBotException {
+        if(type==null)ProtocolValidator.invalid("媒体类型为空");
+        ProtocolValidator.maximum(type);
+        MediaContent value=new MediaContent(mediaId);value.setTitle(title);value.setDescription(description);return value;
     }
     @Deprecated
     public void replyMedia(Frame callback,String type,String mediaId) throws IOException {SdkFutures.awaitIo(replyMediaAsync(callback,type,mediaId));}
     public CompletionStage<Frame> sendMediaMessageAsync(String chatId,int chatType,String type,String mediaId) {return sendMediaMessageAsync(chatId,chatType,type,mediaId,null,null);}
     public CompletionStage<Frame> sendMediaMessageAsync(String chatId,int chatType,String type,String mediaId,String title,String description) {
-        if(type==null)return SdkFutures.failed(new AiBotException(AiBotException.Code.INVALID_ARGUMENT,"媒体类型为空"));
-        SendMsgBody body=new SendMsgBody();body.setChatId(chatId);body.setChatType(chatType);body.setMsgType(type);MediaContent value=new MediaContent(mediaId);value.setTitle(title);value.setDescription(description);
-        switch(type){case "image":body.setImage(value);break;case "file":body.setFile(value);break;case "voice":body.setVoice(value);break;case "video":body.setVideo(value);break;default:return SdkFutures.failed(new AiBotException(AiBotException.Code.INVALID_ARGUMENT,"媒体类型无效"));}
-        return sendMessageAsync(body);
+        try {
+            SendMsgBody body=new SendMsgBody();body.setChatId(chatId);body.setChatType(chatType);body.setMsgType(type);MediaContent value=media(type,mediaId,title,description);
+            switch(type){case Constants.MSG_TYPE_IMAGE:body.setImage(value);break;case Constants.MSG_TYPE_FILE:body.setFile(value);break;case Constants.MSG_TYPE_VOICE:body.setVoice(value);break;case Constants.MSG_TYPE_VIDEO:body.setVideo(value);break;default:ProtocolValidator.invalid("媒体类型无效");}
+            return sendMessageAsync(body);
+        } catch(Exception e){return SdkFutures.failed(e);}
     }
     @Deprecated
     public void sendMediaMessage(String chatId,int chatType,String type,String mediaId) throws IOException,TimeoutException,InterruptedException {SdkFutures.await(sendMediaMessageAsync(chatId,chatType,type,mediaId));}
@@ -191,13 +197,12 @@ public class WeComAiBotClient implements AutoCloseable {
     public CompletionStage<UploadedMedia> uploadMediaAsync(String type,Path path) {return media.upload(type,path);}
     public CompletionStage<MediaUtils.DownloadResult> downloadFileAsync(String url,String aesKey) {return media.download(url,aesKey);}
     public StreamSession newStream(Frame callback) {return newStreamWithId(callback,generateReqId("stream"));}
-    public StreamSession newStreamWithId(Frame callback,String id) {return new StreamSession(this,callback,id,log);}
+    public StreamSession newStreamWithId(Frame callback,String id) {return new StreamSession(this,callback,id);}
     ObjectMapper getObjectMapper() {return mapper;}
     AiBotLogger logger() {return log;}
     StreamRegistry streamRegistry() {return connection.registry();}
     java.util.function.LongSupplier clockSource() {return clock;}
     void awaitReady(long deadline) throws IOException,InterruptedException {connection.awaitReady(deadline);}
-    Options options() {return options;}
     /** 幂等终态关闭；取消媒体任务及连接，不隐式重放已发消息。 */
     @Override public void close() {connection.close();media.close();}
     public void disconnect() {close();}

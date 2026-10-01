@@ -20,6 +20,8 @@ import java.util.regex.Pattern;
 /** 媒体下载与严格企微 AES-256-CBC 解密；上传兼容入口复用客户端可靠核心。 */
 public final class MediaUtils {
     private MediaUtils() {}
+    private static final Pattern ENCODED_FILENAME = Pattern.compile("filename\\*\\s*=\\s*(?:UTF-8|utf-8)''([^;]+)");
+    private static final Pattern PLAIN_FILENAME = Pattern.compile("filename\\s*=\\s*(?:\"([^\"]*)\"|([^;]*))",Pattern.CASE_INSENSITIVE);
     public static class DownloadResult {
         private final byte[] data;
         private final String filename;
@@ -28,7 +30,7 @@ public final class MediaUtils {
         public String getFilename() {return filename;}
     }
     public static DownloadResult downloadFile(String url,String aesKey) throws IOException {
-        return downloadFile(url,aesKey,20*1024*1024L+32,30000,60000);
+        return downloadFile(url,aesKey,Constants.DEFAULT_MAX_DOWNLOAD_BYTES,(int)Constants.DEFAULT_DOWNLOAD_CONNECT_TIMEOUT_MS,(int)Constants.DEFAULT_DOWNLOAD_READ_TIMEOUT_MS);
     }
     static DownloadResult downloadFile(String url,String aesKey,long maxBytes,int connectTimeout,int readTimeout) throws IOException {
         URL source=new URL(url);
@@ -54,8 +56,8 @@ public final class MediaUtils {
     static String filename(String disposition,String path) {
         String value=null;
         if(disposition!=null) {
-            Matcher encoded=Pattern.compile("filename\\*\\s*=\\s*(?:UTF-8|utf-8)''([^;]+)").matcher(disposition);
-            Matcher plain=Pattern.compile("filename\\s*=\\s*(?:\"([^\"]*)\"|([^;]*))",Pattern.CASE_INSENSITIVE).matcher(disposition);
+            Matcher encoded=ENCODED_FILENAME.matcher(disposition);
+            Matcher plain=PLAIN_FILENAME.matcher(disposition);
             try {
                 if(encoded.find())value=URLDecoder.decode(encoded.group(1).trim().replace("+","%2B"),"UTF-8");
                 else if(plain.find())value=plain.group(1)!=null?plain.group(1):plain.group(2).trim();

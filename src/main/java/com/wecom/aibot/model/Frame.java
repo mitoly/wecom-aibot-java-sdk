@@ -26,7 +26,6 @@ public class Frame extends ProtocolModel {
     @JsonInclude(JsonInclude.Include.NON_DEFAULT)
     private int errCode;
 
-    @JsonIgnore private boolean errCodePresent;
     @JsonIgnore private long receivedNanos;
     @JsonIgnore private long generation;
     @JsonIgnore private String clientId;
@@ -73,7 +72,6 @@ public class Frame extends ProtocolModel {
 
     public void setErrCode(int errCode) {
         this.errCode = errCode;
-        this.errCodePresent = true;
     }
 
     public String getErrMsg() {
@@ -83,7 +81,6 @@ public class Frame extends ProtocolModel {
     public void setErrMsg(String errMsg) {
         this.errMsg = errMsg;
     }
-    @JsonIgnore public boolean hasErrCode() { return errCodePresent; }
     @JsonIgnore public long getReceivedNanos() { return receivedNanos; }
     @JsonIgnore public long getGeneration() { return generation; }
     @JsonIgnore public String getClientId() { return clientId; }

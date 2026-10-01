@@ -24,7 +24,8 @@ public class EventInfo extends ProtocolModel {
     @JsonIgnore public String getEventKey() {
         return templateCardEvent != null ? templateCardEvent.getEventKey() : legacy("event_key") != null ? legacy("event_key") : legacy("button_key");
     }
-    @JsonIgnore public String getTaskId() { return templateCardEvent != null ? templateCardEvent.getTaskId() : legacy("task_id"); }
+    /** 卡片事件 task_id 缺失时回退顶层 task_id（与回复侧更新卡片校验同口径）。 */
+    @JsonIgnore public String getTaskId() { return templateCardEvent != null && templateCardEvent.getTaskId() != null ? templateCardEvent.getTaskId() : legacy("task_id"); }
     @Deprecated @JsonIgnore public String getButtonKey() { return getEventKey(); }
     @Deprecated public void setButtonKey(String value) { ensureCard().setEventKey(value); }
     public void setTaskId(String value) { ensureCard().setTaskId(value); }

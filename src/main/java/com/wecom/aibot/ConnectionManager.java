@@ -63,24 +63,11 @@ final class ConnectionManager implements AutoCloseable {
             this.cmd=cmd; this.reqId=reqId; this.target=target; this.body=body; this.generation=generation;
             this.deadline=deadline; this.result=result;
         }
-        boolean finalStream() { return body != null && body.path("stream").path("finish").asBoolean(); }
+        boolean finalStream() { return StreamRegistry.isFinishFrame(body); }
     }
     /** 流状态唯一记账（跨连接）；本类只管连接、队列与写 socket。 */
     private final StreamRegistry registry;
 
-    ConnectionManager(Options options, ObjectMapper mapper, OkHttpClient http,
-                      BiConsumer<String, Object> event, java.util.function.Consumer<Frame> inbound) {
-        this(options,mapper,http,event,inbound,http::newWebSocket);
-    }
-    ConnectionManager(Options options, ObjectMapper mapper, OkHttpClient http,
-                      BiConsumer<String, Object> event, java.util.function.Consumer<Frame> inbound, SocketConnector connector) {
-        this(options,mapper,http,event,inbound,connector,System::nanoTime);
-    }
-    ConnectionManager(Options options, ObjectMapper mapper, OkHttpClient http,
-                      BiConsumer<String, Object> event, java.util.function.Consumer<Frame> inbound,
-                      SocketConnector connector, java.util.function.LongSupplier clock) {
-        this(options,mapper,http,event,inbound,connector,clock,new AiBotLogger.Slf4jLogger());
-    }
     ConnectionManager(Options options, ObjectMapper mapper, OkHttpClient http,
                       BiConsumer<String, Object> event, java.util.function.Consumer<Frame> inbound,
                       SocketConnector connector, java.util.function.LongSupplier clock, AiBotLogger log) {
@@ -95,7 +82,6 @@ final class ConnectionManager implements AutoCloseable {
     }
     BotConnectionState state() { return state; }
     String clientId() { return clientId; }
-    long generation() { Session s=active; return s==null ? 0 : s.generation; }
     StreamRegistry registry() { return registry; }
     CompletionStage<Void> termination() { return terminated; }
 
@@ -202,11 +188,13 @@ final class ConnectionManager implements AutoCloseable {
         try { write(s,new Frame(Constants.CMD_PING,new Headers(reqId),null)); }
         catch (IOException e) { end(s,error(AiBotException.Code.SEND_FAILED,"心跳发送失败"),false); }
     }
+    /** 主动发送（新 req_id）：不绑定回调连接代，无回复窗口；调用方保证 body 为独占树。 */
+    synchronized CompletionStage<Frame> request(String cmd, String reqId, JsonNode body, String target) { return request(cmd,reqId,body,target,-1,Long.MAX_VALUE); }
     synchronized CompletionStage<Frame> request(String cmd, String reqId, JsonNode body, String target, long expectedGeneration, long deadline) {
         if (state!=BotConnectionState.READY) return SdkFutures.failed(error(terminal(state)?terminalCode():AiBotException.Code.NOT_READY,"客户端未就绪: "+state));
         if (!capacity.tryAcquire()) return SdkFutures.failed(error(AiBotException.Code.QUEUE_FULL,"全局在途请求容量已满"));
         CompletableFuture<Frame> future=new CompletableFuture<>();
-        Envelope item=new Envelope(cmd,reqId,target,body.deepCopy(),expectedGeneration,deadline,future);
+        Envelope item=new Envelope(cmd,reqId,target,body,expectedGeneration,deadline,future);
         try { lifecycle.execute(() -> enqueue(item)); }
         catch (RejectedExecutionException e) { capacity.release(); return SdkFutures.failed(error(AiBotException.Code.CLOSED,"客户端已关闭")); }
         return future;
@@ -230,14 +218,13 @@ final class ConnectionManager implements AutoCloseable {
             Envelope item=queue.peekFirst();
             try {
                 if (clock.getAsLong()>=item.deadline) throw error(AiBotException.Code.DEADLINE_EXCEEDED,"回复窗口已过期");
-                long startedAt=registry.startedAt(item.streamKey);
-                if (startedAt!=0 && clock.getAsLong()-startedAt>=TimeUnit.MILLISECONDS.toNanos(Constants.STREAM_MAX_DURATION_MS)) throw error(AiBotException.Code.DEADLINE_EXCEEDED,"流刷新超过十分钟");
-                if(startedAt!=0 && item.body.path("stream").has("feedback"))log.warn("流式续帧携带 feedback（官方未限制首帧，放行发送）: {}",item.streamKey);
+                if (registry.windowExpired(item.streamKey,clock.getAsLong())) throw error(AiBotException.Code.DEADLINE_EXCEEDED,"流刷新超过十分钟");
+                if(registry.startedAt(item.streamKey)!=0 && item.body.path("stream").has("feedback"))log.warn("流式续帧携带 feedback（官方未限制首帧，放行发送）: {}",item.streamKey);
                 if (item.target!=null) messages.acquire(item.target);
                 if (Constants.CMD_UPLOAD_MEDIA_INIT.equals(item.cmd)) uploads.acquire(options.getBotId());
                 // ACK 等待不超过剩余回复窗口：welcome/卡片更新类 5 秒窗口过期后无需傻等完整 replyAckTimeoutMs
                 long windowMs=TimeUnit.NANOSECONDS.toMillis(Math.max(0,item.deadline-clock.getAsLong()));
-                long timeout=replyCommand(item.cmd) ? Math.max(1,Math.min(options.getReplyAckTimeoutMs(),windowMs)) : options.getRequestTimeoutMs();
+                long timeout=ProtocolValidator.isReplyCommand(item.cmd) ? Math.max(1,Math.min(options.getReplyAckTimeoutMs(),windowMs)) : options.getRequestTimeoutMs();
                 item.timeout=lifecycle.schedule(() -> poison(s,item,error(AiBotException.Code.UNKNOWN,"ACK 超时，发送结果未知；该 req_id 已禁止续发，继续回复需等待新回调")),timeout,TimeUnit.MILLISECONDS);
                 write(s,new Frame(item.cmd,new Headers(item.reqId),item.body)); item.sent=true;
                 registry.onSent(item.streamKey,clock.getAsLong());
@@ -322,7 +309,6 @@ final class ConnectionManager implements AutoCloseable {
     }
     private AiBotException.Code terminalCode() { return state==BotConnectionState.SUPERSEDED ? AiBotException.Code.SUPERSEDED : state==BotConnectionState.FAILED ? AiBotException.Code.RETRY_EXHAUSTED : AiBotException.Code.CLOSED; }
     private static boolean terminal(BotConnectionState state) { return state==BotConnectionState.CLOSED || state==BotConnectionState.FAILED || state==BotConnectionState.SUPERSEDED; }
-    private static boolean replyCommand(String cmd) { return Constants.CMD_RESPOND_MSG.equals(cmd)||Constants.CMD_RESPOND_UPDATE_MSG.equals(cmd)||Constants.CMD_RESPOND_WELCOME_MSG.equals(cmd); }
     private static void cancel(Future<?> task) { if(task!=null)task.cancel(false); }
     private static AiBotException error(AiBotException.Code code,String message){return new AiBotException(code,message);}
     private static AiBotException rejection(Frame frame){return new AiBotException(AiBotException.Code.SERVER_REJECTED,"服务端拒绝请求，errcode="+frame.getErrCode(),frame.getErrCode(),null);}

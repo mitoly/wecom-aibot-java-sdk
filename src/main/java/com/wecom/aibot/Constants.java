@@ -1,5 +1,7 @@
 package com.wecom.aibot;
 
+import java.util.concurrent.TimeUnit;
+
 /**
  * SDK 常量定义：WebSocket 帧命令类型和事件名称。
  */
@@ -104,6 +106,21 @@ public final class Constants {
 
     /** 单帧写入超时时间（毫秒） */
     public static final long DEFAULT_REQUEST_TIMEOUT_MS = 10_000L;
+
+    /** 下载大小上限默认值（20MB + AES 块余量） */
+    public static final long DEFAULT_MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024L + 32;
+
+    /** 下载连接超时默认值（毫秒） */
+    public static final long DEFAULT_DOWNLOAD_CONNECT_TIMEOUT_MS = 30_000L;
+
+    /** 下载读取超时默认值（毫秒） */
+    public static final long DEFAULT_DOWNLOAD_READ_TIMEOUT_MS = 60_000L;
+
+    /** 普通回复（aibot_respond_msg）官方窗口：自回调起 24 小时 */
+    public static final long REPLY_WINDOW_NANOS = TimeUnit.HOURS.toNanos(24);
+
+    /** 事件类回复（欢迎语/卡片更新）官方窗口：自事件回调起 5 秒 */
+    public static final long EVENT_REPLY_WINDOW_NANOS = TimeUnit.SECONDS.toNanos(5);
 
     /** 流式消息最大持续时间（毫秒） */
     public static final long STREAM_MAX_DURATION_MS = 10 * 60 * 1000L;
